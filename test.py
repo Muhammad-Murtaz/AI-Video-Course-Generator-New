@@ -30,7 +30,7 @@ def generate_chapter(chapter):
         f"{BASE_URL}/generate-video-content",
         json=payload,
         headers={"Content-Type": "application/json"},
-        timeout=120,
+         timeout=600,
     )
 
     print(f"Status: {response.status_code}")

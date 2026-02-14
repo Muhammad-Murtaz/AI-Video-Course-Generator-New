@@ -18,7 +18,10 @@ export default function CourseList() {
     try {
       const result = await axios.get("/api/course");
       console.log("Course :", result.data);
-      const transformedData: Course[] = result.data.map((course: any) => ({
+      const courses = Array.isArray(result.data)
+        ? result.data
+        : result.data.courses;
+      const transformedData: Course[] = courses.map((course: any) => ({
         id: course.id,
         courseId: course.course_id,
         courseName: course.course_name,

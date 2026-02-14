@@ -1,70 +1,142 @@
-version: "3.8"
+# docker-compose.yml
+# ─────────────────────────────────────────────────────────────────────────────
+# Services:
+#   api          → FastAPI (4 Uvicorn workers via Gunicorn)
+#   celery-ai    → Celery worker for ai_generation queue
+#   celery-video → Celery worker for video_proc queue
+#   celery-maint → Celery worker for maintenance queue
+#   celery-beat  → Periodic task scheduler
+#   flower       → Celery monitoring UI  (localhost:5555)
+#   redis        → Broker + cache backend
+#   nginx        → Reverse proxy + load balancer
+# ─────────────────────────────────────────────────────────────────────────────
+
+version: "3.9"
+
+x-common-env: &common-env
+  DATABASE_URL:         ${DATABASE_URL}
+  REDIS_HOST:           redis
+  REDIS_PORT:           6379
+  REDIS_URL:            redis://redis:6379/0
+  CELERY_BROKER_URL:    redis://redis:6379/0
+  CELERY_BACKEND_URL:   redis://redis:6379/1
+  OPENAI_API_KEY:       ${OPENAI_API_KEY}
+  GEMINI_API_KEY:       ${GEMINI_API_KEY}
+  SECRET_KEY:           ${SECRET_KEY}
+  APP_ENV:              production
+
+x-api-base: &api-base
+  build:
+    context: .
+    dockerfile: Dockerfile
+  environment: *common-env
+  depends_on:
+    redis:
+      condition: service_healthy
+  restart: unless-stopped
 
 services:
-  postgres:
-    image: postgres:15
-    container_name: ai_course_db
-    environment:
-      POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: postgres
-      POSTGRES_DB: ai_video_course
-    ports:
-      - "5432:5432"
-    volumes:
-      - postgres_data:/var/lib/postgresql/data
 
-  redis:
-    image: redis:7-alpine
-    container_name: ai_course_redis
-    ports:
-      - "6379:6379"
-    volumes:
-      - redis_data:/data
-
-  backend:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    container_name: ai_course_backend
-    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+  # ── FastAPI Application ─────────────────────────────────────────────────────
+  api:
+    <<: *api-base
+    command: >
+      gunicorn main:app
+        --worker-class uvicorn.workers.UvicornWorker
+        --workers 4
+        --bind 0.0.0.0:8000
+        --timeout 120
+        --graceful-timeout 30
+        --log-level info
     ports:
       - "8000:8000"
-    env_file:
-      - .env
-    depends_on:
-      - postgres
-      - redis
-    volumes:
-      - .:/app
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
 
-  celery_worker:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    container_name: ai_course_celery
-    command: celery -A app.tasks.celery_tasks worker --loglevel=info
-    env_file:
-      - .env
-    depends_on:
-      - postgres
-      - redis
-    volumes:
-      - .:/app
+  # ── Celery — AI Generation Worker ──────────────────────────────────────────
+  celery-ai:
+    <<: *api-base
+    command: >
+      celery -A app.task.celery_app.celery_app worker
+        --queues ai_generation
+        --concurrency 4
+        --loglevel info
+        --hostname ai@%h
+    deploy:
+      replicas: 2           # Scale horizontally for AI-heavy workloads
 
-  celery_beat:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    container_name: ai_course_celery_beat
-    command: celery -A app.tasks.celery_tasks beat --loglevel=info
-    env_file:
-      - .env
-    depends_on:
-      - postgres
-      - redis
+  # ── Celery — Video Processing Worker ───────────────────────────────────────
+  celery-video:
+    <<: *api-base
+    command: >
+      celery -A app.task.celery_app.celery_app worker
+        --queues video_proc
+        --concurrency 2
+        --loglevel info
+        --hostname video@%h
+
+  # ── Celery — Maintenance Worker ────────────────────────────────────────────
+  celery-maint:
+    <<: *api-base
+    command: >
+      celery -A app.task.celery_app.celery_app worker
+        --queues maintenance
+        --concurrency 1
+        --loglevel info
+        --hostname maint@%h
+
+  # ── Celery Beat (Periodic Scheduler) ───────────────────────────────────────
+  celery-beat:
+    <<: *api-base
+    command: >
+      celery -A app.task.celery_app.celery_app beat
+        --loglevel info
+        --schedule /tmp/celerybeat-schedule
+
+  # ── Flower (Celery Monitoring) ──────────────────────────────────────────────
+  flower:
+    <<: *api-base
+    command: >
+      celery -A app.task.celery_app.celery_app flower
+        --port=5555
+        --broker=redis://redis:6379/0
+    ports:
+      - "5555:5555"
+
+  # ── Redis ───────────────────────────────────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    command: >
+      redis-server
+        --maxmemory 512mb
+        --maxmemory-policy allkeys-lru
+        --save 60 1000
+        --appendonly yes
     volumes:
-      - .:/app
+      - redis_data:/data
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ── Nginx (Reverse Proxy + Infrastructure Load Balancer) ───────────────────
+  nginx:
+    image: nginx:alpine
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+    ports:
+      - "80:80"
+      - "443:443"
+    depends_on:
+      - api
+    restart: unless-stopped
 
 volumes:
-  postgres_data:
   redis_data:

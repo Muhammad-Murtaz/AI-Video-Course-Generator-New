@@ -4,7 +4,7 @@ import cloudinary
 import logging
 import cloudinary.uploader
 import requests
-from app.services.rate_limiter import audio_rate_limiter
+
 import tempfile
 import os
 
@@ -16,6 +16,7 @@ class AudioService:
     def __init__(self):
         self.phonad_lab_api_key = settings.PHONAD_LAB_API_KEY
         cloudinary.config(
+            timeout=300,
             cloud_name=settings.CLOUDINARY_CLOUD_NAME,
             api_key=settings.CLOUDINARY_API_KEY,
             api_secret=settings.CLOUDINARY_API_SECRET,
@@ -25,6 +26,7 @@ class AudioService:
     def _init_fallback(self):
         try:
             from gtts import gTTS
+
             self.gtts = gTTS
             self.fallback_available = True
         except Exception:
@@ -62,7 +64,7 @@ class AudioService:
         temp_file.close()
 
         try:
-            tts = self.gtts(text=text, lang='en')
+            tts = self.gtts(text=text, lang="en")
             tts.save(temp_path)
 
             with open(temp_path, "rb") as f:
@@ -73,7 +75,6 @@ class AudioService:
             if os.path.exists(temp_path):
                 os.unlink(temp_path)
 
-    @audio_rate_limiter
     def _generate_audio_chunk(self, text: str) -> bytes:
         url = "https://api.fonada.ai/tts/generate-audio-large"
         headers = {
