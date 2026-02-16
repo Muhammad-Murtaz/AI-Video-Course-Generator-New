@@ -1,26 +1,13 @@
 """
 rate_limiter.py
-─────────────────────────────────────────────────────────────────────────────
-Redis-backed sliding-window rate limiter for FastAPI.
-
-Why replace pyrate-limiter?
-  - pyrate-limiter uses in-process state → doesn't scale across workers/pods
-  - This implementation uses Redis atomic LUA scripts → consistent across
-    all Uvicorn workers, Kubernetes pods, and Celery workers
-  - Supports per-user, per-IP, and per-endpoint limits simultaneously
-  - Adds Retry-After header so clients back off gracefully
-
-Usage:
-    from app.middleware.rate_limiter import RateLimitDep
-
-    @router.post("/generate-course", dependencies=[Depends(RateLimitDep("course_gen"))])
-    async def generate():
-        ...
-─────────────────────────────────────────────────────────────────────────────
+Redis sliding-window rate limiter with graceful degradation.
+If Redis is unavailable, requests are ALLOWED (fail-open) rather than crashing.
 """
+
 from __future__ import annotations
 
 import time
+import os
 from typing import Optional, Callable
 
 import redis.asyncio as aioredis
@@ -29,106 +16,106 @@ from starlette.status import HTTP_429_TOO_MANY_REQUESTS
 
 from app.core.config import settings
 
-
-# ─── Redis connection pool (shared across all requests) ──────────────────────
+# ── Redis pool ────────────────────────────────────────────────────────────────
 _redis_pool: Optional[aioredis.Redis] = None
 
 
-async def get_redis() -> aioredis.Redis:
+async def get_redis() -> Optional[aioredis.Redis]:
+    """Returns Redis client, or None if unavailable."""
     global _redis_pool
     if _redis_pool is None:
-        _redis_pool = aioredis.from_url(
-            settings.REDIS_URL,
-            encoding="utf-8",
-            decode_responses=True,
-            max_connections=50,
-        )
+        try:
+            _redis_pool = aioredis.from_url(
+                settings.REDIS_URL,
+                encoding="utf-8",
+                decode_responses=True,
+                max_connections=50,
+                socket_connect_timeout=1,  # fast fail
+                socket_timeout=1,
+            )
+        except Exception:
+            return None
     return _redis_pool
 
 
-# ─── Sliding-window LUA script (atomic, no race conditions) ──────────────────
-# KEYS[1] = rate-limit key
-# ARGV[1] = window size in seconds
-# ARGV[2] = max allowed requests in window
-# ARGV[3] = current timestamp (milliseconds)
+# ── Sliding-window LUA script ─────────────────────────────────────────────────
 _SLIDING_WINDOW_SCRIPT = """
 local key        = KEYS[1]
 local window_ms  = tonumber(ARGV[1]) * 1000
 local limit      = tonumber(ARGV[2])
 local now        = tonumber(ARGV[3])
 local window_start = now - window_ms
-
--- Remove timestamps outside the current window
 redis.call('ZREMRANGEBYSCORE', key, '-inf', window_start)
-
--- Count remaining requests
 local count = redis.call('ZCARD', key)
-
 if count < limit then
-    -- Add current timestamp and refresh TTL
     redis.call('ZADD', key, now, now)
     redis.call('EXPIRE', key, tonumber(ARGV[1]) + 1)
-    return {0, limit - count - 1}   -- {allowed=0, remaining}
+    return {0, limit - count - 1}
 else
-    -- Return oldest timestamp so client knows when window resets
     local oldest = redis.call('ZRANGE', key, 0, 0, 'WITHSCORES')
     local reset_at = window_start
     if #oldest > 0 then reset_at = tonumber(oldest[2]) end
-    return {1, reset_at}            -- {blocked=1, reset_at_ms}
+    return {1, reset_at}
 end
 """
 
+# ── Limit presets ─────────────────────────────────────────────────────────────
+IS_DEV = os.getenv("APP_ENV", "production") == "development"
 
-# ─── Named limit presets ─────────────────────────────────────────────────────
 LIMIT_PRESETS: dict[str, dict] = {
-    "general":     {"requests": 60,  "window": 60},   # 60 req/min
-    "course_gen":  {"requests": 5,   "window": 60},   # 5 req/min  (heavy AI)
-    "video_gen":   {"requests": 10,  "window": 60},   # 10 req/min
-    "auth":        {"requests": 10,  "window": 60},   # 10 req/min (signups)
-    "read":        {"requests": 200, "window": 60},   # 200 req/min (GET)
+    "general": {"requests": 120 if IS_DEV else 60, "window": 60},
+    "course_gen": {"requests": 20 if IS_DEV else 5, "window": 60},
+    "video_gen": {"requests": 30 if IS_DEV else 10, "window": 60},
+    "auth": {"requests": 20 if IS_DEV else 10, "window": 60},
+    "read": {"requests": 500 if IS_DEV else 200, "window": 60},
 }
 
 
-# ─── Core rate-limit check ────────────────────────────────────────────────────
-
+# ── Core check ────────────────────────────────────────────────────────────────
 async def _check_rate_limit(
     request: Request,
     preset: str,
     identifier: Optional[str] = None,
 ) -> None:
     """
-    Raises HTTP 429 if the rate limit is exceeded.
-    Identifier priority: user email header → IP address
+    Enforces rate limit. If Redis is down, silently allows the request
+    (fail-open) rather than returning a 500 or 422.
     """
     redis = await get_redis()
-    cfg = LIMIT_PRESETS.get(preset, LIMIT_PRESETS["general"])
-    limit   = cfg["requests"]
-    window  = cfg["window"]
+    if redis is None:
+        # Redis unavailable — fail open (don't block legitimate requests)
+        return
 
-    # Build a key that is unique per endpoint + identifier
+    cfg = LIMIT_PRESETS.get(preset, LIMIT_PRESETS["general"])
+    limit = cfg["requests"]
+    window = cfg["window"]
+
     ident = (
         identifier
         or request.headers.get("x-user-email")
         or request.headers.get("x-forwarded-for")
-        or request.client.host
+        or (request.client.host if request.client else None)
         or "anonymous"
     )
     endpoint = request.url.path.replace("/", "_")
     redis_key = f"rl:{preset}:{endpoint}:{ident}"
-
     now_ms = int(time.time() * 1000)
 
-    result = await redis.eval(
-        _SLIDING_WINDOW_SCRIPT,
-        1,         # numkeys
-        redis_key,
-        window,
-        limit,
-        now_ms,
-    )
+    try:
+        result = await redis.eval(
+            _SLIDING_WINDOW_SCRIPT,
+            1,
+            redis_key,
+            window,
+            limit,
+            now_ms,
+        )
+    except Exception:
+        # Redis eval failed (connection dropped, etc.) — fail open
+        return
 
-    blocked    = int(result[0])
-    extra      = int(result[1])
+    blocked = int(result[0])
+    extra = int(result[1])
 
     if blocked:
         reset_at_ms = extra
@@ -144,31 +131,17 @@ async def _check_rate_limit(
         )
 
 
-# ─── FastAPI Dependency factories ─────────────────────────────────────────────
-
+# ── Dependency factory ────────────────────────────────────────────────────────
 def RateLimitDep(preset: str = "general") -> Callable:
-    """
-    Returns a FastAPI dependency for the given preset.
-
-    Example:
-        @router.post("/foo", dependencies=[Depends(RateLimitDep("course_gen"))])
-    """
     async def _dep(request: Request) -> None:
         await _check_rate_limit(request, preset)
+
     return _dep
 
 
-# ─── Global middleware variant (all routes) ───────────────────────────────────
-
+# ── Global middleware ─────────────────────────────────────────────────────────
 class RateLimitMiddleware:
-    """
-    Starlette middleware that applies 'general' rate limiting to every route.
-    Certain paths are whitelisted (health checks, docs).
-
-    Add to app:
-        app.add_middleware(RateLimitMiddleware)
-    """
-    WHITELIST = {"/", "/health", "/docs", "/openapi.json", "/redoc"}
+    WHITELIST = {"/", "/health", "/docs", "/openapi.json", "/redoc", "/api/cache/stats"}
 
     def __init__(self, app):
         self.app = app
@@ -182,6 +155,7 @@ class RateLimitMiddleware:
                     await _check_rate_limit(request, "general")
                 except HTTPException as exc:
                     from starlette.responses import JSONResponse
+
                     response = JSONResponse(
                         status_code=exc.status_code,
                         content=exc.detail,

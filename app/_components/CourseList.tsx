@@ -2,7 +2,6 @@
 import { useEffect, useState } from "react";
 import axios from "axios";
 import { useUser } from "@clerk/nextjs";
-
 import CourseListCard from "./CourseListCard";
 import { Course } from "@/type/CourseType";
 
@@ -11,56 +10,42 @@ export default function CourseList() {
   const [courseList, setCourseList] = useState<Course[]>([]);
 
   useEffect(() => {
-    if (user) getCourseList();
+    if (user) fetchCourses();
   }, [user]);
 
-  const getCourseList = async () => {
+  const fetchCourses = async () => {
     try {
-      const result = await axios.get("/api/course");
-      console.log("Course :", result.data);
-      const courses = Array.isArray(result.data)
-        ? result.data
-        : result.data.courses;
-      const transformedData: Course[] = courses.map((course: any) => ({
-        id: course.id,
-        courseId: course.course_id,
-        courseName: course.course_name,
-        userId: course.user_id,
-        userInput: course.user_input,
-        type: course.type,
-        courseLayout: course.course_layout,
-        createdAt: course.created_at
+      const { data } = await axios.get("/api/course");
+      // Backend returns { courses: [...] }
+      const raw: any[] = data.courses ?? data;
+
+      const courses: Course[] = raw.map((c) => ({
+        id: c.id,
+        courseId: c.course_id ?? c.courseId,
+        courseName: c.course_name ?? c.courseName,
+        userId: c.user_id ?? c.userId,
+        userInput: c.user_input ?? c.userInput,
+        type: c.type,
+        courseLayout: c.course_layout ?? c.courseLayout,
+        createdAt: c.created_at ?? c.createdAt,
       }));
 
-      setCourseList(transformedData);
-    } catch (e) {
-      console.error(e);
+      setCourseList(courses);
+    } catch {
+      // silently fail — user sees empty state
     }
   };
 
+  if (!user || courseList.length === 0) return null;
+
   return (
     <div className="max-w-6xl w-full mt-10 px-4">
-      {/* {!user && (
-        <>
-          <h2 className="font-bold text-xl">Popular Courses</h2>
-          <div className="grid grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-3 mt-3">
-            {HERO_COURSES.map((c, i) => (
-              <CourseListCard key={i} course={c as any} />
-            ))}
-          </div>
-        </>
-      )} */}
-
-      {user && courseList.length > 0 && (
-        <>
-          <h2 className="font-bold text-xl">My Courses</h2>
-          <div className="grid grid-cols-2 lg:grid-cols-3 xl:grid-cols-3 gap-3 mt-3 bg-white">
-            {courseList.map((c, i) => (
-              <CourseListCard key={i} course={c} />
-            ))}
-          </div>
-        </>
-      )}
+      <h2 className="font-bold text-xl mb-3">My Courses</h2>
+      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
+        {courseList.map((c) => (
+          <CourseListCard key={c.courseId} course={c} />
+        ))}
+      </div>
     </div>
   );
 }

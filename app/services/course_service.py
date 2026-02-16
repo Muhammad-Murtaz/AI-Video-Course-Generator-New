@@ -1,12 +1,17 @@
-# app/services/course_service.py
 from typing import List
 from fastapi import HTTPException, status
+from concurrent.futures import ThreadPoolExecutor
 from app.schemas.course import CourseCreate
 from app.services.langchain_service import langchain_generator
 from app.services.caption_service import caption_service
 from app.services.audio_service import audio_service
 from app.db.model import ChapterContentSlide, CourseIntroSlide, User, Course
 from sqlalchemy.orm import Session
+import logging
+
+logger = logging.getLogger(__name__)
+
+MAX_FREE_COURSES = 4
 
 
 class CourseService:
@@ -20,12 +25,9 @@ class CourseService:
                 status_code=status.HTTP_400_BAD_REQUEST, detail="User not found"
             )
 
-        user_courses = db.query(Course).filter(Course.user_id == user_email).all()
-        if len(user_courses) >= 4:
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail="Course creation limit reached",
-            )
+        user_courses = db.query(Course).filter(Course.user_id == user_email).count()
+        if user_courses >= MAX_FREE_COURSES:
+            raise ValueError("max-limit")
 
         course_layout = langchain_generator.generate_course_layout(
             user_input=course_data.user_input, type=course_data.type
@@ -41,130 +43,132 @@ class CourseService:
             type=course_data.type,
             course_layout=course_layout,
         )
-
         db.add(course)
         db.commit()
         db.refresh(course)
         return course
 
+    def _process_slide(self, slide: dict):
+        audio_buffer = audio_service.generate_audio(slide["narration"]["fullText"])
+        audio_url = audio_service.save_audio_to_storage(
+            audio_buffer, slide["audioFileName"]
+        )
+        caption = caption_service.generate_captions(audio_url)
+        return {"slide": slide, "audio_url": audio_url, "caption": caption}
+
     def generate_course_introduction(
         self, db: Session, course_id: str, course_layout: dict
     ):
-        existing_intro = (
+        existing = (
             db.query(CourseIntroSlide)
             .filter(CourseIntroSlide.course_id == course_id)
             .first()
         )
-
-        if existing_intro:
+        if existing:
             return {"message": "Introduction already exists", "skipped": True}
 
-        # Generate 5-6 intro slides for ~2-3 minute introduction
         intro_content = langchain_generator.generate_course_introduction(course_layout)
 
-        audio_file_urls = []
-        caption_array = []
+        with ThreadPoolExecutor(max_workers=5) as executor:
+            results = list(executor.map(self._process_slide, intro_content))
 
-        for i, slide in enumerate(intro_content):
-            narration = slide["narration"]["fullText"]
-            audio_buffer = audio_service.generate_audio(narration)
-            audio_url = audio_service.save_audio_to_storage(
-                audio_buffer=audio_buffer, file_name=slide["audioFileName"]
-            )
-            audio_file_urls.append(audio_url)
-
-            caption = caption_service.generate_captions(audio_url)
-            caption_array.append(caption)
-
-            slide_record = CourseIntroSlide(
-                course_id=course_id,
-                slide_id=slide["slideId"],
-                slide_index=slide["slideIndex"],
-                audio_file_name=slide["audioFileName"],
-                narration=slide["narration"],
-                html=slide["html"],
-                reveal_data=slide["revealData"],
-                audio_file_url=audio_url,
-                caption=caption,
+        audio_urls, captions = [], []
+        for r in results:
+            slide = r["slide"]
+            audio_urls.append(r["audio_url"])
+            captions.append(r["caption"])
+            db.add(
+                CourseIntroSlide(
+                    course_id=course_id,
+                    slide_id=slide["slideId"],
+                    slide_index=slide["slideIndex"],
+                    audio_file_name=slide["audioFileName"],
+                    narration=slide["narration"],
+                    html=slide["html"],
+                    reveal_data=slide["revealData"],
+                    audio_file_url=r["audio_url"],
+                    caption=r["caption"],
+                )
             )
 
-            db.add(slide_record)
-            db.commit()
-
+        db.commit()
         return {
             "introContent": intro_content,
-            "audioUrls": audio_file_urls,
-            "captions": caption_array,
+            "audioUrls": audio_urls,
+            "captions": captions,
         }
 
     def get_course_by_id(self, db: Session, course_id: str):
         course = db.query(Course).filter(Course.course_id == course_id).first()
-        if course:
-            slides = (
-                db.query(ChapterContentSlide)
-                .filter(ChapterContentSlide.course_id == course_id)
-                .all()
-            )
-            intro_slides = (
-                db.query(CourseIntroSlide)
-                .filter(CourseIntroSlide.course_id == course_id)
-                .all()
-            )
-            course_dict = {
-                "id": course.id,
-                "courseId": course.course_id,
-                "courseName": course.course_name,
-                "userId": course.user_id,
-                "userInput": course.user_input,
-                "type": course.type,
-                "courseLayout": course.course_layout,
-                "createdAt": course.created_at.isoformat(),
-                "courseIntroSlides": [
-                    {
-                        "id": slide.id,
-                        "courseId": slide.course_id,
-                        "slideId": slide.slide_id,
-                        "slideIndex": slide.slide_index,
-                        "audioFileName": slide.audio_file_name,
-                        "narration": slide.narration,
-                        "html": slide.html,
-                        "revealData": slide.reveal_data,
-                        "audioFileUrl": slide.audio_file_url,
-                        "caption": slide.caption,
-                    }
-                    for slide in intro_slides
-                ],
-                "chapterContentSlide": [
-                    {
-                        "id": slide.id,
-                        "courseId": slide.course_id,
-                        "chapterId": slide.chapter_id,
-                        "slideId": slide.slide_id,
-                        "slideIndex": slide.slide_index,
-                        "audioFileName": slide.audio_file_name,
-                        "narration": slide.narration,
-                        "html": slide.html,
-                        "revealData": slide.reveal_data,
-                        "audioFileUrl": slide.audio_file_url,
-                        "caption": slide.caption,
-                    }
-                    for slide in slides
-                ],
-            }
-            return course_dict
-        return None
+        if not course:
+            return None
+
+        slides = (
+            db.query(ChapterContentSlide)
+            .filter(ChapterContentSlide.course_id == course_id)
+            .order_by(ChapterContentSlide.slide_index)
+            .all()
+        )
+
+        intro_slides = (
+            db.query(CourseIntroSlide)
+            .filter(CourseIntroSlide.course_id == course_id)
+            .order_by(CourseIntroSlide.slide_index)
+            .all()
+        )
+
+        return {
+            "id": course.id,
+            "courseId": course.course_id,
+            "courseName": course.course_name,
+            "userId": course.user_id,
+            "userInput": course.user_input,
+            "type": course.type,
+            "courseLayout": course.course_layout,
+            "createdAt": course.created_at.isoformat(),
+            "courseIntroSlides": [
+                {
+                    "id": s.id,
+                    "courseId": s.course_id,
+                    "slideId": s.slide_id,
+                    "slideIndex": s.slide_index,
+                    "audioFileName": s.audio_file_name,
+                    "narration": s.narration,
+                    "html": s.html,
+                    "revealData": s.reveal_data,
+                    "audioFileUrl": s.audio_file_url,
+                    "caption": s.caption,
+                }
+                for s in intro_slides
+            ],
+            "chapterContentSlide": [
+                {
+                    "id": s.id,
+                    "courseId": s.course_id,
+                    "chapterId": s.chapter_id,
+                    "slideId": s.slide_id,
+                    "slideIndex": s.slide_index,
+                    "audioFileName": s.audio_file_name,
+                    "narration": s.narration,
+                    "html": s.html,
+                    "revealData": s.reveal_data,
+                    "audioFileUrl": s.audio_file_url,
+                    "caption": s.caption,
+                }
+                for s in slides
+            ],
+        }
 
     def get_user_courses(self, db: Session, user_email: str) -> List[Course]:
-        courses = (
+        return (
             db.query(Course)
             .filter(Course.user_id == user_email)
             .order_by(Course.id.desc())
             .all()
         )
-        return courses
 
     def generate_video_content(self, db: Session, chapter: dict, course_id: str):
-        existing_slide = (
+        existing = (
             db.query(ChapterContentSlide)
             .filter(
                 ChapterContentSlide.course_id == course_id,
@@ -172,49 +176,62 @@ class CourseService:
             )
             .first()
         )
-
-        if existing_slide:
+        if existing:
             return {"message": "Content already exists", "skipped": True}
 
         video_content = langchain_generator.generate_video_content(chapter)
+        logger.info(
+            "Generated %d slides for chapter %s",
+            len(video_content),
+            chapter["chapterId"],
+        )
 
-        audio_file_urls = []
-        caption_array = []
+        with ThreadPoolExecutor(max_workers=5) as executor:
+            futures = {
+                executor.submit(self._process_slide, slide): slide
+                for slide in video_content
+            }
+            results = []
+            for future, slide in futures.items():
+                try:
+                    results.append(future.result())
+                except Exception as e:
+                    logger.error(
+                        "Slide processing failed for slideId=%s: %s",
+                        slide.get("slideId", "unknown"),
+                        e,
+                        exc_info=True,
+                    )
+                    raise HTTPException(
+                        status_code=500,
+                        detail=f"Failed to process slide {slide.get('slideId', 'unknown')}: {str(e)}",
+                    )
 
-        for i, slide in enumerate(video_content):
-            # if i > 0:
-            #     break
-
-            narration = slide["narration"]["fullText"]
-            audio_buffer = audio_service.generate_audio(narration)
-            audio_url = audio_service.save_audio_to_storage(
-                audio_buffer=audio_buffer, file_name=slide["audioFileName"]
+        audio_urls, captions = [], []
+        for r in results:
+            slide = r["slide"]
+            audio_urls.append(r["audio_url"])
+            captions.append(r["caption"])
+            db.add(
+                ChapterContentSlide(
+                    course_id=course_id,
+                    chapter_id=chapter["chapterId"],
+                    slide_id=slide["slideId"],
+                    slide_index=slide["slideIndex"],
+                    audio_file_name=slide["audioFileName"],
+                    narration=slide["narration"],
+                    html=slide["html"],
+                    reveal_data=slide["revealData"],
+                    audio_file_url=r["audio_url"],
+                    caption=r["caption"],
+                )
             )
-            audio_file_urls.append(audio_url)
 
-            caption = caption_service.generate_captions(audio_url)
-            caption_array.append(caption)
-
-            slide_record = ChapterContentSlide(
-                course_id=course_id,
-                chapter_id=chapter["chapterId"],
-                slide_id=slide["slideId"],
-                slide_index=slide["slideIndex"],
-                audio_file_name=slide["audioFileName"],
-                narration=slide["narration"],
-                html=slide["html"],
-                reveal_data=slide["revealData"],
-                audio_file_url=audio_url,
-                caption=caption,
-            )
-
-            db.add(slide_record)
-            db.commit()
-
+        db.commit()
         return {
             "videoContent": video_content,
-            "audioUrls": audio_file_urls,
-            "captions": caption_array,
+            "audioUrls": audio_urls,
+            "captions": captions,
         }
 
 

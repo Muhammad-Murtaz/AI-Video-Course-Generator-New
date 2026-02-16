@@ -1,5 +1,5 @@
 "use client";
-import { ChapterContentSlide } from "@/type/CourseType";
+import { ChapterContentSlide, CourseIntroSlide } from "@/type/CourseType";
 import {
   useCurrentFrame,
   useVideoConfig,
@@ -8,36 +8,81 @@ import {
   Sequence
 } from "remotion";
 
+type AnySlide = ChapterContentSlide | CourseIntroSlide;
+
 interface Props {
-  slides: ChapterContentSlide[];
-  durationBySlideId: Record<string, number> | null;
+  slides: AnySlide[];
+  durationBySlideId: Record<string, number>;
 }
 
-const DEFAULT_SLIDE_DURATION = 180; // 6 seconds at 30fps
+const getSlideAtFrame = (
+  frame: number,
+  slides: AnySlide[],
+  durationBySlideId: Record<string, number>
+) => {
+  let cumulative = 0;
+  for (const slide of slides) {
+    const dur = durationBySlideId[slide.slideId] || 180;
+    if (frame < cumulative + dur) {
+      return {
+        slide,
+        localFrame: frame - cumulative,
+        duration: dur,
+        startFrame: cumulative
+      };
+    }
+    cumulative += dur;
+  }
+  const last = slides[slides.length - 1];
+  const lastDur = durationBySlideId[last?.slideId] || 180;
+  return {
+    slide: last,
+    localFrame: lastDur - 1,
+    duration: lastDur,
+    startFrame: cumulative - lastDur
+  };
+};
 
-// Single slide component
-function SlideContent({
-  slide,
-  duration
-}: {
-  slide: ChapterContentSlide;
-  duration: number;
-}) {
+export default function CourseComposition({
+  slides,
+  durationBySlideId
+}: Props) {
   const frame = useCurrentFrame();
   const { fps } = useVideoConfig();
 
-  const captionChunks = slide?.caption?.chunks || [];
-  const currentTime = frame / fps;
-  let currentCaption = "";
-
-  for (const chunk of captionChunks) {
-    if (chunk.start !== undefined && chunk.end !== undefined) {
-      if (currentTime >= chunk.start && currentTime <= chunk.end) {
-        currentCaption = chunk.text || "";
-        break;
-      }
-    }
+  if (!slides?.length) {
+    return (
+      <AbsoluteFill>
+        <div
+          style={{
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+            width: "100%",
+            height: "100%",
+            background: "#111"
+          }}
+        >
+          <p style={{ color: "#fff", fontSize: 28 }}>No slides available</p>
+        </div>
+      </AbsoluteFill>
+    );
   }
+
+  const { slide, localFrame, duration, startFrame } = getSlideAtFrame(
+    frame,
+    slides,
+    durationBySlideId
+  );
+  const currentTime = localFrame / fps;
+  const currentCaption =
+    slide?.caption?.chunks?.find(
+      (chunk) =>
+        chunk.start !== undefined &&
+        chunk.end !== undefined &&
+        currentTime >= chunk.start &&
+        currentTime <= chunk.end
+    )?.text || "";
 
   return (
     <AbsoluteFill>
@@ -51,10 +96,11 @@ function SlideContent({
           overflow: "hidden"
         }}
       >
-        {/* Audio */}
-        {slide?.audioFileUrl && <Audio src={slide.audioFileUrl} />}
-
-        {/* Slide HTML */}
+        {slide?.audioFileUrl && (
+          <Sequence from={startFrame} durationInFrames={duration}>
+            <Audio src={slide.audioFileUrl} />
+          </Sequence>
+        )}
         <div
           style={{
             position: "absolute",
@@ -73,8 +119,6 @@ function SlideContent({
             style={{ color: "#fff", width: "100%", maxWidth: "900px" }}
           />
         </div>
-
-        {/* Caption bar */}
         <div
           style={{
             position: "absolute",
@@ -101,59 +145,6 @@ function SlideContent({
           </p>
         </div>
       </div>
-    </AbsoluteFill>
-  );
-}
-
-export default function CourseComposition({
-  slides,
-  durationBySlideId
-}: Props) {
-  if (!slides || slides.length === 0) {
-    return (
-      <AbsoluteFill>
-        <div
-          style={{
-            display: "flex",
-            alignItems: "center",
-            justifyContent: "center",
-            width: "100%",
-            height: "100%",
-            background: "#111"
-          }}
-        >
-          <p style={{ color: "#fff", fontSize: 28 }}>No slides available</p>
-        </div>
-      </AbsoluteFill>
-    );
-  }
-
-  // Calculate cumulative start times for each slide
-  let cumulativeFrame = 0;
-  const slideSequences = slides.map((slide) => {
-    const duration =
-      durationBySlideId?.[slide.slideId] || DEFAULT_SLIDE_DURATION;
-    const startFrame = cumulativeFrame;
-    cumulativeFrame += duration;
-
-    return {
-      slide,
-      from: startFrame,
-      durationInFrames: duration
-    };
-  });
-
-  return (
-    <AbsoluteFill style={{ background: "#000" }}>
-      {slideSequences.map((seq, index) => (
-        <Sequence
-          key={seq.slide.slideId || index}
-          from={seq.from}
-          durationInFrames={seq.durationInFrames}
-        >
-          <SlideContent slide={seq.slide} duration={seq.durationInFrames} />
-        </Sequence>
-      ))}
     </AbsoluteFill>
   );
 }

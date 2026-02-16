@@ -1,13 +1,8 @@
 "use client";
 import Link from "next/link";
-import moment from "moment";
-import { Play, Layers, Calendar, Dot } from "lucide-react";
-
-import {
-  Card,
-  CardContent,
-  CardHeader,
-} from "@/components/ui/card";
+import { formatDistanceToNow } from "date-fns";
+import { Play, Layers, Calendar } from "lucide-react";
+import { Card, CardContent } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Course } from "@/type/CourseType";
 
@@ -16,39 +11,45 @@ interface Props {
 }
 
 export default function CourseListCard({ course }: Props) {
+  const name = course.courseName ?? course.courseLayout?.courseName ?? "Untitled";
+  const level = course.courseLayout?.level;
+  const chapters = course.courseLayout?.totalChapters ?? 0;
+  const createdAt = course.createdAt ? new Date(course.createdAt) : null;
+
   return (
-    <Card className="w-full bg-white">
-      <CardHeader className="bg-white p-4">
-        <div className="flex items-center justify-between">
-          <h2 className="font-medium">{course.courseName || course.courseLayout?.courseName}</h2>
-          <h2 className="text-sm px-2 py-1 border rounded-2xl border-primary text-primary bg-primary/10">
-            {course.courseLayout?.level}
-          </h2>
+    <Card className="group hover:shadow-md transition-shadow duration-200">
+      {/* Top color strip */}
+      <div className="h-1.5 w-full bg-gradient-to-r from-primary/70 to-primary rounded-t-xl" />
+
+      <CardContent className="pt-4 pb-5 px-5">
+        <div className="flex items-start justify-between gap-2 mb-3">
+          <h3 className="font-semibold text-sm leading-snug line-clamp-2">{name}</h3>
+          {level && (
+            <span className="text-xs px-2 py-0.5 border rounded-full border-primary/40 text-primary bg-primary/5 whitespace-nowrap flex-shrink-0">
+              {level}
+            </span>
+          )}
         </div>
 
-        <div className="flex items-center gap-3 mt-2">
-          <h2 className="flex items-center gap-1 text-xs text-slate-600 bg-slate-100 border border-slate-300 px-2 py-1 rounded">
+        <div className="flex items-center gap-3 text-xs text-muted-foreground mb-4 flex-wrap">
+          <span className="flex items-center gap-1">
             <Layers className="w-3 h-3" />
-            {course.courseLayout?.totalChapters} Chapters
-          </h2>
-          <h2 className="flex items-center gap-1 text-xs text-slate-600 bg-slate-100 border border-slate-300 px-2 py-1 rounded">
-            <Calendar className="w-3 h-3" />
-            {moment(course.createdAt).format("MM/DD/YYYY")}
-            <Dot className="w-4 h-4" />
-            {moment(course.createdAt).fromNow()}
-          </h2>
+            {chapters} chapters
+          </span>
+          {createdAt && (
+            <span className="flex items-center gap-1">
+              <Calendar className="w-3 h-3" />
+              {formatDistanceToNow(createdAt, { addSuffix: true })}
+            </span>
+          )}
         </div>
-      </CardHeader>
 
-      <CardContent className="bg-white">
-        <div className="flex items-center justify-between">
-          <p className="text-sm text-gray-500">Keep learning</p>
-          <Link href={`/course/${course.courseId}`}>
-            <Button size="sm">
-              <Play className="w-4 h-4 mr-1" /> Watch Now
-            </Button>
-          </Link>
-        </div>
+        <Link href={`/course/${course.courseId}`}>
+          <Button size="sm" className="w-full group-hover:bg-primary/90 transition-colors">
+            <Play className="w-3.5 h-3.5 mr-1.5" />
+            Watch Now
+          </Button>
+        </Link>
       </CardContent>
     </Card>
   );

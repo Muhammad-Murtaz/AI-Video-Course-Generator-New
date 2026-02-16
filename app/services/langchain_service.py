@@ -1,22 +1,19 @@
-# app/services/langchain_service.py
-from typing import Dict, List
+from typing import Dict, List, Type
 import logging
+import json
+import re
+
 from langchain_core.messages import HumanMessage, SystemMessage
 from fastapi import HTTPException
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_groq import ChatGroq
 from app.core.config import settings
-from pydantic import BaseModel, Field
-import json
-import re
+from pydantic import BaseModel
 
-logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
-# ─────────────────────────────────────────────
-# Pydantic Schemas
-# ─────────────────────────────────────────────
+# ── Pydantic Schemas ──────────────────────────────────────────────────────────
 
 
 class NarrationModel(BaseModel):
@@ -76,30 +73,18 @@ class CourseLayoutOutput(BaseModel):
     chapters: List[ChapterModel]
 
 
-# ─────────────────────────────────────────────
-# JSON cleaning (only used for Groq fallback)
-# ─────────────────────────────────────────────
+# ── JSON cleaning ─────────────────────────────────────────────────────────────
 
 
-def _extract_json_object(raw: str) -> str:
-    raw = re.sub(r"^```json\s*", "", raw.strip(), flags=re.MULTILINE)
-    raw = re.sub(r"^```\s*", "", raw, flags=re.MULTILINE)
-    raw = re.sub(r"\s*```$", "", raw, flags=re.MULTILINE)
-    match = re.search(r"\{.*\}", raw, re.DOTALL)
-    return match.group(0).strip() if match else raw.strip()
+def clean_json_string(raw: str) -> str:
+    cleaned = raw.strip()
+    cleaned = re.sub(r"^```json\s*", "", cleaned)
+    cleaned = re.sub(r"^```\s*", "", cleaned)
+    cleaned = re.sub(r"\s*```$", "", cleaned)
+    return cleaned.strip()
 
 
-def _extract_json_array(raw: str) -> str:
-    raw = re.sub(r"^```json\s*", "", raw.strip(), flags=re.MULTILINE)
-    raw = re.sub(r"^```\s*", "", raw, flags=re.MULTILINE)
-    raw = re.sub(r"\s*```$", "", raw, flags=re.MULTILINE)
-    match = re.search(r"\[.*\]", raw, re.DOTALL)
-    return match.group(0).strip() if match else raw.strip()
-
-
-# ─────────────────────────────────────────────
-# Service
-# ─────────────────────────────────────────────
+# ── Service ───────────────────────────────────────────────────────────────────
 
 
 class LangchainCourseGeneratorService:
@@ -117,174 +102,193 @@ class LangchainCourseGeneratorService:
             api_key=settings.GROQ_API_KEY,
         )
 
-    def _invoke_with_fallback(
-        self,
-        messages: list,
-        pydantic_schema: BaseModel,
-        groq_response_type: str = "object",  # "object" or "array"
-        groq_array_key: str = "slides",  # key wrapping array in Groq JSON response
-    ):
-        """
-        Strategy:
-        - Gemini: .with_structured_output(pydantic_schema) — forced structured output
-        - Groq fallback: JSON mode with explicit schema instructions in prompt, then validate with Pydantic
-        """
-
-        # ── 1. Try Gemini with structured output ──
+    def _invoke_with_fallback(self, messages: list, pydantic_schema: Type[BaseModel]):
+        # 1. Try Gemini with structured output
         try:
-            logger.info("🔵 Attempting Gemini with structured output...")
-            structured_llm = self.llm.with_structured_output(pydantic_schema)
-            result = structured_llm.invoke(messages)
-            logger.info("✅ Gemini structured output succeeded")
-            return result
+            return self.llm.with_structured_output(pydantic_schema).invoke(messages)
         except Exception as e:
-            logger.warning(f"⚠️ Gemini failed: {e}")
+            logger.warning("Gemini failed, falling back to Groq: %s", e)
 
-        # ── 2. Groq fallback: JSON mode ──
-        logger.info("🟢 Falling back to Groq (JSON mode)...")
+        # 2. Groq JSON fallback
         try:
-            groq_json_llm = self.fallback_llm.bind(
-                response_format={"type": "json_object"}
+            schema_hint = (
+                "\n\nReturn ONLY a single valid JSON object matching this exact schema "
+                "(no extra wrapper keys, no markdown fences):\n"
+                f"{json.dumps(pydantic_schema.model_json_schema(), indent=2)}"
             )
+            augmented = list(messages)
+            augmented[-1] = HumanMessage(content=messages[-1].content + schema_hint)
 
-            # Inject schema hint into the last user message
-            schema_hint = f"\n\nReturn ONLY valid JSON matching this schema:\n{json.dumps(pydantic_schema.model_json_schema(), indent=2)}"
-            augmented_messages = list(messages)
-            last = augmented_messages[-1]
-            augmented_messages[-1] = HumanMessage(content=last.content + schema_hint)
-
-            response = groq_json_llm.invoke(augmented_messages)
+            response = self.fallback_llm.bind(
+                response_format={"type": "json_object"}
+            ).invoke(augmented)
             raw_text = (
                 response.content
                 if isinstance(response.content, str)
                 else str(response.content)
             )
 
-            # Parse and validate via Pydantic
-            parsed_dict = json.loads(_extract_json_object(raw_text))
-
-            # Handle case where Groq wraps array in a key (e.g. {"slides": [...]})
-            if groq_response_type == "array" and isinstance(parsed_dict, dict):
-                # Try common wrapper keys
-                for key in [groq_array_key, "slides", "chapters", "data", "items"]:
-                    if key in parsed_dict and isinstance(parsed_dict[key], list):
-                        parsed_dict = {groq_array_key: parsed_dict[key]}
-                        break
-
-            result = pydantic_schema.model_validate(parsed_dict)
-            logger.info("✅ Groq JSON mode succeeded")
-            return result
-
-        except Exception as groq_error:
-            logger.error(f"❌ Groq also failed: {groq_error}")
+            parsed = json.loads(clean_json_string(raw_text))
+            return pydantic_schema.model_validate(parsed)
+        except Exception as e:
+            logger.error("Groq also failed: %s", e)
             raise HTTPException(
-                status_code=500,
-                detail="Both Gemini and Groq failed to generate content",
+                status_code=500, detail="Both AI providers failed to generate content"
             )
 
-    # ─────────────────────────────────────────
-    # generate_course_layout
-    # ─────────────────────────────────────────
-    def generate_course_layout(self, user_input: str, type: str):
-        system_prompt = """You are a course structure generator.
-Generate a comprehensive course structure based on the user's input.
-- Generate 6-10 chapters for full courses
-- Each chapter should have 3-5 sub-content items
-- Make courseId unique and descriptive (snake_case)"""
+    # ── Public methods ────────────────────────────────────────────────────────
 
+    def generate_course_layout(self, user_input: str, type: str) -> dict:
         messages = [
-            SystemMessage(content=system_prompt),
+            SystemMessage(
+                content=(
+                    "You are a course structure generator.\n"
+                    "Return a single flat JSON object with these exact fields:\n"
+                    "  courseName, courseDescription, courseId (snake_case), level (Beginner|Intermediate|Advanced),\n"
+                    "  totalChapters (int), chapters (array: chapterId, chapterTitle, subContent[])\n"
+                    "Rules: 6-10 chapters for full-course, 3-5 for quick-explain-video. Each chapter: 3-5 subContent items."
+                )
+            ),
             HumanMessage(content=f"Course Topic: {user_input}\nCourse Type: {type}"),
         ]
+        result = self._invoke_with_fallback(messages, CourseLayoutOutput)
+        return result.model_dump()
 
-        result: CourseLayoutOutput = self._invoke_with_fallback(
-            messages,
-            CourseLayoutOutput,
-            groq_response_type="object",
-        )
-        parsed = result.model_dump()
-        logger.info(f"✅ Course layout generated: {parsed.get('courseName')}")
-        return parsed
-
-    # ─────────────────────────────────────────
-    # generate_course_introduction
-    # ─────────────────────────────────────────
-    def generate_course_introduction(self, course_layout: Dict):
-        system_prompt = """You are a professional course creator. Generate exactly 5-6 highly engaging introduction slides.
-
-Each slide narration should be 500-750 characters.
-
-Cover these topics:
-1. Welcome & Course Overview
-2. Why this topic is critical today
-3. Learning Path (visual step-by-step timeline)
-4. Prerequisites & Target Audience
-5. Projects (2-3 concrete project cards)
-6. Getting Started & Success Tips
-
-Return a JSON object with a "slides" array containing 5-6 slide objects.
-Each slide: slideId, slideIndex, audioFileName, narration (fullText), html, revealData (elementsToReveal array).
-Make HTML visually appealing with Tailwind, modern gradients, large typography."""
-
+    def generate_course_introduction(self, course_layout: Dict) -> list:
         messages = [
-            SystemMessage(content=system_prompt),
+            SystemMessage(
+                content=(
+                    "You are a professional course creator.\n"
+                    "Return a JSON object with a 'slides' array of 5-6 introduction slides.\n"
+                    "Each slide: slideId, slideIndex, audioFileName, narration (fullText 500-750 chars),\n"
+                    "html (Tailwind CDN, dark gradient, large typography), revealData (elementsToReveal array).\n"
+                    "Slide topics: Welcome & Overview, Why this topic matters, Learning Path,\n"
+                    "Prerequisites & Audience, Projects, Getting Started."
+                )
+            ),
             HumanMessage(
                 content=f"Generate introduction slides for:\n{json.dumps(course_layout, indent=2)}"
             ),
         ]
+        result = self._invoke_with_fallback(messages, IntroSlidesOutput)
+        return [s.model_dump() for s in result.slides]
 
-        result: IntroSlidesOutput = self._invoke_with_fallback(
-            messages,
-            IntroSlidesOutput,
-            groq_response_type="array",
-            groq_array_key="slides",
-        )
-        parsed = [s.model_dump() for s in result.slides]
-        logger.info(f"✅ Course intro generated: {len(parsed)} slides")
-        return parsed
-
-    # ─────────────────────────────────────────
-    # generate_video_content
-    # ─────────────────────────────────────────
-    def generate_video_content(self, chapter_details: Dict):
-        system_prompt = """You are an expert instructional designer.
-
-INPUT:
-{
-  "courseName": string,
-  "chapterTitle": string,
-  "chapterSlug": string,
-  "subContent": string[]  // each item = 1 slide
-}
-
-Return a JSON object with a "slides" array. Each slide object:
-- slideId: "{chapterSlug}-{slideIndex}"
-- slideIndex: starts at 1
-- title, subtitle
-- audioFileName: "{chapterSlug}-{slideId}.mp3"
-- narration.fullText: 8-14 sentences, teacher-style explanation
-- revealData: ["r1","r2","r3","r4","r5"]
-- html: self-contained HTML (1280x720, dark theme, Tailwind CDN, reveal CSS)
-  .reveal { opacity:0; transform:translateY(12px); }
-  .reveal.is-on { opacity:1; transform:translateY(0); }
-  Elements use data-reveal="r1" etc., start with class "reveal"
-
-Per slide include: definition (r1), analogy (r2), code example (r3), code breakdown (r4), pro tip (r5)."""
-
+    def generate_video_content(self, chapter_details: Dict) -> list:
         messages = [
-            SystemMessage(content=system_prompt),
+            SystemMessage(
+                content=(
+                    "You are an expert instructional designer and motion UI engineer.\n\n"
+                    "INPUT:\n"
+                    "{\n"
+                    '  "courseName": string,\n'
+                    '  "chapterTitle": string,\n'
+                    '  "chapterSlug": string,\n'
+                    '  "subContent": string[]\n'
+                    "}\n\n"
+                    "TASK:\n"
+                    "For EVERY subContent item generate exactly 3 slides (A, B, C).\n"
+                    "Total slides = subContent.length × 3.\n"
+                    "Return ONLY a flat JSON array. No markdown, no wrapper keys.\n\n"
+                    "STRICT SLIDE SCHEMA:\n"
+                    "{\n"
+                    '  "slideId": "{chapterSlug}-{slideIndex}",\n'
+                    '  "slideIndex": number (starts at 1, increments across ALL slides),\n'
+                    '  "title": string,\n'
+                    '  "subtitle": string,\n'
+                    '  "audioFileName": "{chapterSlug}-{slideId}.mp3",\n'
+                    '  "narration": { "fullText": string },\n'
+                    '  "html": string,\n'
+                    '  "revealData": ["r1","r2","r3","r4",...]\n'
+                    "}\n\n"
+                    "NARRATION RULES:\n"
+                    "  8-14 sentences, 600-1000 characters.\n"
+                    "  Slide A: explain what it is, why it matters, real-world analogy, how it works.\n"
+                    "  Slide B: walk through the code line by line, explain every line.\n"
+                    "  Slide C: recap 3 key takeaways verbally, end with a challenge question.\n"
+                    "  Write like a teacher talking to a beginner — never just name a concept.\n"
+                    "  NO reveal tokens in narration text (no r1, r2, data-reveal).\n\n"
+                    "REVEAL SYSTEM:\n"
+                    "  revealData = ['r1','r2','r3',...] — one key per narration sentence group.\n"
+                    "  Every revealed HTML element MUST have: class='reveal' data-reveal='rN'.\n"
+                    "  No JS needed — external system adds 'is-on' class to show elements.\n"
+                    "  CSS MUST be in inline <style>:\n"
+                    "    .reveal{opacity:0;transform:translateY(16px);transition:opacity 0.5s ease,transform 0.5s ease}\n"
+                    "    .reveal.is-on{opacity:1;transform:translateY(0)}\n\n"
+                    "HTML RULES (renders in React Remotion 1280x720):\n"
+                    "  - Single self-contained HTML string.\n"
+                    "  - Root: <div style='width:1280px;height:720px;overflow:hidden;position:relative'>\n"
+                    "  - Include: <script src='https://cdn.tailwindcss.com'></script>\n"
+                    "  - ALL meaningful content MUST be visible as text on screen.\n"
+                    "  - DO NOT put content only in narration — the slide must SHOW it visually.\n"
+                    "  - Every concept, every code line, every takeaway MUST appear as rendered text.\n\n"
+                    "═══════════════════════════════════════════════\n"
+                    "SLIDE A — CONCEPT SLIDE (what + why + analogy)\n"
+                    "═══════════════════════════════════════════════\n"
+                    "Layout: full dark gradient bg (slate-900 → blue-950), padding 48px.\n"
+                    "  TOP ROW: courseName (text-sm uppercase tracking-widest text-blue-300) | chapterTitle (text-sm text-white/50)\n"
+                    "  HERO: concept title (text-6xl font-black text-white, reveals as r1) + subtitle (text-xl text-blue-200, reveals as r2)\n"
+                    "  DEFINITION BOX (r3): rounded-2xl bg-white/10 backdrop-blur p-6 border-l-4 border-blue-400\n"
+                    "    Show the FULL definition as 2-3 sentences of white text. Not just a label.\n"
+                    "  CARDS ROW (r4, r5...): 3 cards side by side, each card MUST contain:\n"
+                    "    - Icon (emoji or SVG)\n"
+                    "    - Bold label (e.g. 'Why it matters')\n"
+                    "    - 2-3 sentences of actual explanation text (text-sm text-white/80)\n"
+                    "    Card style: rounded-2xl bg-white/10 backdrop-blur border border-white/20 p-5\n"
+                    "  ANALOGY BOX (last reveal): rounded-2xl bg-amber-500/20 border border-amber-400/40 p-5\n"
+                    "    Show '💡 Real-world analogy:' label + 2-3 sentences explaining the analogy in plain English.\n\n"
+                    "═══════════════════════════════════════════════\n"
+                    "SLIDE B — CODE SLIDE (real code + walkthrough)\n"
+                    "═══════════════════════════════════════════════\n"
+                    "Layout: split — LEFT 38% explanation, RIGHT 62% code. Full dark bg (gray-950).\n"
+                    "  LEFT PANEL (bg-gray-900, h-full, p-8):\n"
+                    "    Title (text-3xl font-black text-white, r1)\n"
+                    "    Subtitle (text-base text-gray-400, r1)\n"
+                    "    Numbered steps — each step reveals separately (r2, r3, r4...):\n"
+                    "      Circle badge (bg-blue-500 text-white font-bold w-8 h-8 rounded-full)\n"
+                    "      Step title in bold white\n"
+                    "      Step description: 2 sentences explaining what this line does and why\n"
+                    "  RIGHT PANEL (bg-gray-950, h-full, p-8, font-mono):\n"
+                    "    Code block header: language label (text-xs text-gray-500) + filename\n"
+                    "    FULL CODE: every line shown as real syntax-highlighted text.\n"
+                    "      Use <span> colors: keywords=text-purple-400, strings=text-green-400,\n"
+                    "      numbers=text-yellow-300, comments=text-gray-500, functions=text-blue-300\n"
+                    "    Each code section that matches a step gets highlighted with bg-yellow-400/20\n"
+                    "    and the reveal class matching that step (r2, r3...).\n"
+                    "    OUTPUT BOX (last reveal, rN): bg-black/60 rounded-xl p-4 mt-4\n"
+                    "      Label: 'Output:' in text-gray-400 text-xs\n"
+                    "      Show the ACTUAL printed output in text-cyan-300 font-mono text-sm\n\n"
+                    "═══════════════════════════════════════════════\n"
+                    "SLIDE C — RECAP SLIDE (written takeaways + quiz)\n"
+                    "═══════════════════════════════════════════════\n"
+                    "Layout: dark bg with radial teal/purple gradient. padding 48px.\n"
+                    "  TOP: '✅ Chapter Recap' (text-5xl font-black text-white, r1)\n"
+                    "       Subtitle: chapter topic in text-xl text-white/60 (r1)\n"
+                    "  TAKEAWAY CARDS — 3 cards, each reveals separately (r2, r3, r4):\n"
+                    "    Card style: rounded-2xl bg-gradient-to-r from-green-900/50 to-emerald-900/30\n"
+                    "                border-l-4 border-green-400 p-5 mb-3\n"
+                    "    Each card MUST show:\n"
+                    "      ✅ icon + bold takeaway title (text-lg font-bold text-green-300)\n"
+                    "      2-3 sentences written explanation of WHY this takeaway matters (text-sm text-white/80)\n"
+                    "      A SHORT code snippet or example inline (text-xs font-mono text-yellow-300 bg-black/30 rounded px-2)\n"
+                    "  CHALLENGE BOX (r5 — last reveal):\n"
+                    "    Style: rounded-2xl bg-amber-500/20 border-2 border-amber-400/50 p-6\n"
+                    "    '🧠 Try it yourself:' label (text-sm font-bold text-amber-300 uppercase tracking-wide)\n"
+                    "    The challenge question in text-xl font-semibold text-white (full sentence, specific task)\n"
+                    "    A hint line: 'Hint: ...' in text-sm text-amber-200/70 italic\n\n"
+                    "CRITICAL CONTENT RULES:\n"
+                    "  1. EVERY slide MUST display its educational content as VISIBLE TEXT on screen.\n"
+                    "  2. Narration and HTML content must MATCH — if narration explains X, the slide must SHOW X.\n"
+                    "  3. Code on Slide B MUST be real, runnable, topic-specific code — not placeholder comments.\n"
+                    "  4. Takeaway cards on Slide C MUST contain written explanations, not just titles.\n"
+                    "  5. Never use lorem ipsum, never use placeholder text.\n"
+                    "  6. If subContent topic is 'Python Lists', show actual list syntax, actual list methods, actual output.\n\n"
+                    "OUTPUT: valid flat JSON array only. No trailing commas, no comments, no extra fields.\n"
+                )
+            ),
             HumanMessage(content=json.dumps(chapter_details, indent=2)),
         ]
-
-        result: VideoSlidesOutput = self._invoke_with_fallback(
-            messages,
-            VideoSlidesOutput,
-            groq_response_type="array",
-            groq_array_key="slides",
-        )
-        parsed = [s.model_dump() for s in result.slides]
-        logger.info(f"✅ Video content generated: {len(parsed)} slides")
-        return parsed
+        result = self._invoke_with_fallback(messages, VideoSlidesOutput)
+        return [s.model_dump() for s in result.slides]
 
 
 langchain_generator = LangchainCourseGeneratorService()
