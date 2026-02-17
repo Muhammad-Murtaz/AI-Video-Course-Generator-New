@@ -7,8 +7,6 @@ on:
 jobs:
   Continuous-Integration:
     runs-on: ubuntu-latest
-    outputs:
-      ecr-registry: ${{ steps.login-ecr.outputs.registry }}
     steps:
       - name: Checkout
         uses: actions/checkout@v3
@@ -39,9 +37,6 @@ jobs:
     needs: Continuous-Integration
     runs-on: self-hosted
     steps:
-      - name: Checkout
-        uses: actions/checkout@v3
-
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v2
         with:
@@ -60,7 +55,7 @@ jobs:
 
       - name: Pull latest image
         run: |
-          docker pull ${{ needs.Continuous-Integration.outputs.ecr-registry }}/${{ secrets.ECR_REPO }}:latest
+          docker pull ${{ steps.login-ecr.outputs.registry }}/${{ secrets.ECR_REPO }}:latest
 
       - name: Run Docker container
         run: |
@@ -88,7 +83,7 @@ jobs:
             -e REDIS_PORT="${{ secrets.REDIS_PORT }}" \
             -e REDIS_PASSWORD="${{ secrets.REDIS_PASSWORD }}" \
             -p 8000:8000 \
-            ${{ needs.Continuous-Integration.outputs.ecr-registry }}/${{ secrets.ECR_REPO }}:latest
+            ${{ steps.login-ecr.outputs.registry }}/${{ secrets.ECR_REPO }}:latest
 
       - name: Clean up old images
         run: docker image prune -af
