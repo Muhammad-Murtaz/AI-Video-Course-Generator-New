@@ -14,15 +14,15 @@
 version: "3.9"
 
 x-common-env: &common-env
-  DATABASE_URL:         ${DATABASE_URL}
-  REDIS_HOST:           redis
-  REDIS_PORT:           6379
-  REDIS_URL:            redis://redis:6379/0
-  CELERY_BROKER_URL:    redis://redis:6379/0
-  CELERY_BACKEND_URL:   redis://redis:6379/1
-  GEMINI_API_KEY:       ${GEMINI_API_KEY}
-  SECRET_KEY:           ${SECRET_KEY}
-  APP_ENV:              production
+  DATABASE_URL: ${DATABASE_URL}
+  REDIS_HOST: redis
+  REDIS_PORT: 6379
+  REDIS_URL: redis://redis:6379/0
+  CELERY_BROKER_URL: redis://redis:6379/0
+  CELERY_BACKEND_URL: redis://redis:6379/1
+  GEMINI_API_KEY: ${GEMINI_API_KEY}
+  SECRET_KEY: ${SECRET_KEY}
+  APP_ENV: production
 
 x-api-base: &api-base
   build:
@@ -35,12 +35,11 @@ x-api-base: &api-base
   restart: unless-stopped
 
 services:
-
   # ── FastAPI Application ─────────────────────────────────────────────────────
   api:
     <<: *api-base
     command: >
-      gunicorn main:app
+      gunicorn app.main:app
         --worker-class uvicorn.workers.UvicornWorker
         --workers 4
         --bind 0.0.0.0:8000
@@ -66,7 +65,7 @@ services:
         --loglevel info
         --hostname ai@%h
     deploy:
-      replicas: 2           # Scale horizontally for AI-heavy workloads
+      replicas: 2 # Scale horizontally for AI-heavy workloads
 
   # ── Celery — Video Processing Worker ───────────────────────────────────────
   celery-video:
