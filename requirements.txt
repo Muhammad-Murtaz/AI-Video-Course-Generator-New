@@ -1,30 +1,43 @@
-# requirements.txt
+# Web framework
 fastapi
 uvicorn
-langchain
-langchain-community
-langchain-google-genai
-psycopg2-binary
-cloudinary
-alembic
-pyttsx3
-langchain_groq
-email-validator
-python-dotenv
-pydantic
-pydantic-settings
+
+# Database
 sqlalchemy
 psycopg2-binary
-fastapi 
-pydantic[email] 
-python-jose[cryptography] 
-passlib[bcrypt] 
-python-multipart
 alembic
-python-dotenv
-azure-storage-blob
-requests
-replicate
+
+# Auth
+python-jose[cryptography]
+passlib[bcrypt]
 python-multipart
+pydantic[email]
+pydantic-settings
+python-dotenv
+
+# LangChain / AI
+langchain
+langchain-community
+langchain-core
+langchain-text-splitters
+langchain-google-genai
+langchain-groq
+langgraph
+google-genai                  # Gemini SDK (also used for embeddings in cache.py)
+
+# Async tasks
+celery[redis]
 redis
-celery
+
+# Audio
+gtts
+pydub
+imagekitio
+
+# HTTP / utilities
+requests
+httpx
+orjson
+
+replicate
+

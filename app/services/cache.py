@@ -1,21 +1,12 @@
 """
 cache.py  (production rewrite)
 ─────────────────────────────────────────────────────────────────────────────
-Multi-tier caching system — production-grade improvements over original:
+Multi-tier caching system.
 
-PROBLEMS FIXED vs original cache.py:
-  1. In-memory embeddings lost on restart → now persisted in Redis
-  2. L1 dict not thread-safe → replaced with OrderedDict + threading.Lock
-  3. Pickle for Redis values → JSON (safer, human-readable)
-  4. Semantic model loaded blocking main thread → lazy-loaded in thread pool
-  5. No TTL propagation on L2→L1 promotion → fixed
-  6. stats dict not thread-safe → atomic with locks
-  7. _evict_l1_lru was O(n) → O(1) with OrderedDict move_to_end
-
-Architecture:
-  L1  │ OrderedDict LRU  │ In-process, ~100 entries, sub-millisecond
-  L2  │ Redis            │ Shared across workers, configurable TTL
-  L3  │ Semantic (Redis) │ Embedding similarity for paraphrased queries
+L1  │ OrderedDict LRU  │ In-process, ~256 entries, sub-millisecond
+L2  │ Redis            │ Shared across workers, configurable TTL
+L3  │ Semantic (Redis) │ Embedding similarity — uses Gemini text-embedding-004
+                         (replaces sentence-transformers + torch, saves ~2.5 GB)
 ─────────────────────────────────────────────────────────────────────────────
 """
 from __future__ import annotations
@@ -30,27 +21,38 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import redis
-from sklearn.metrics.pairwise import cosine_similarity
 
 logger = logging.getLogger(__name__)
 
-# ─── Lazy model loader ────────────────────────────────────────────────────────
 
-_model = None
-_model_lock = threading.Lock()
+# ─── Gemini embedding helper ──────────────────────────────────────────────────
+
+def _cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
+    """Pure-numpy cosine similarity between two 1-D vectors."""
+    denom = np.linalg.norm(a) * np.linalg.norm(b)
+    if denom == 0:
+        return 0.0
+    return float(np.dot(a, b) / denom)
 
 
-def _get_model():
-    """Load sentence-transformer model once, lazily, thread-safely."""
-    global _model
-    if _model is None:
-        with _model_lock:
-            if _model is None:
-                from sentence_transformers import SentenceTransformer
-                logger.info("Loading SentenceTransformer model…")
-                _model = SentenceTransformer("all-MiniLM-L6-v2")
-                logger.info("SentenceTransformer model ready")
-    return _model
+def _get_gemini_embedding(text: str) -> np.ndarray:
+    """
+    Call Gemini text-embedding-004 and return a float32 numpy array.
+    Requires GEMINI_API_KEY in environment (loaded via app.core.config).
+    """
+    try:
+        import google.generativeai as genai
+        from app.core.config import settings
+        genai.configure(api_key=settings.GEMINI_API_KEY)
+        result = genai.embed_content(
+            model="models/text-embedding-004",
+            content=text,
+            task_type="SEMANTIC_SIMILARITY",
+        )
+        return np.array(result["embedding"], dtype=np.float32)
+    except Exception as exc:
+        logger.warning("Gemini embedding failed: %s", exc)
+        raise
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -59,13 +61,14 @@ def _get_model():
 
 class SemanticCache:
     """
-    Stores embeddings in Redis so they survive restarts and are shared
+    Stores Gemini embeddings in Redis so they survive restarts and are shared
     across all worker processes.
 
     Redis key scheme:
       sem:emb:<sha256_of_query>  → JSON list (the embedding vector)
       sem:txt:<sha256_of_query>  → original query text
-      sem:idx                    → Redis SET of all embedding keys
+      sem:map:<sha256_of_query>  → cache_key the embedding maps to
+      sem:idx                    → Redis SET of all query hashes
     """
 
     EMBED_PREFIX = "sem:emb:"
@@ -80,35 +83,26 @@ class SemanticCache:
     ):
         self.r = redis_client
         self.threshold = similarity_threshold
-        self._local_lock = threading.Lock()
 
-    # ── Internal ──────────────────────────────────────────────────────────────
+    def _embed_key(self, qhash: str) -> str:
+        return f"{self.EMBED_PREFIX}{qhash}"
 
-    def _embed_key(self, query_hash: str) -> str:
-        return f"{self.EMBED_PREFIX}{query_hash}"
-
-    def _text_key(self, query_hash: str) -> str:
-        return f"{self.TEXT_PREFIX}{query_hash}"
+    def _text_key(self, qhash: str) -> str:
+        return f"{self.TEXT_PREFIX}{qhash}"
 
     def _hash_query(self, query: str) -> str:
         return hashlib.sha256(query.encode()).hexdigest()[:32]
 
-    def _encode(self, text: str) -> np.ndarray:
-        return _get_model().encode(text, convert_to_numpy=True)
-
-    # ── Public API ────────────────────────────────────────────────────────────
-
     def add(self, cache_key: str, query: str) -> None:
-        """Store query embedding in Redis."""
+        """Store Gemini embedding for query in Redis."""
         try:
             qhash = self._hash_query(query)
-            embedding = self._encode(query)
+            embedding = _get_gemini_embedding(query)
 
             pipe = self.r.pipeline()
             pipe.setex(self._embed_key(qhash), self.EMBED_TTL,
                        json.dumps(embedding.tolist()))
-            pipe.setex(self._text_key(qhash),  self.EMBED_TTL, query)
-            # Map query_hash → cache_key so we can retrieve the right result
+            pipe.setex(self._text_key(qhash), self.EMBED_TTL, query)
             pipe.setex(f"sem:map:{qhash}", self.EMBED_TTL, cache_key)
             pipe.sadd(self.INDEX_KEY, qhash)
             pipe.execute()
@@ -118,30 +112,26 @@ class SemanticCache:
     def find_similar(
         self, query: str, max_results: int = 3
     ) -> List[Tuple[str, float]]:
-        """
-        Returns [(cache_key, similarity_score), …] above threshold.
-        """
+        """Return [(cache_key, similarity_score), …] above threshold."""
         try:
-            query_vec = self._encode(query).reshape(1, -1)
+            query_vec = _get_gemini_embedding(query)
             qhashes = self.r.smembers(self.INDEX_KEY)
             if not qhashes:
                 return []
 
-            results: List[Tuple[str, float]] = []
-
-            # Batch-fetch all embeddings
             pipe = self.r.pipeline()
             ordered_hashes = list(qhashes)
             for qh in ordered_hashes:
                 pipe.get(self._embed_key(qh))
             raw_embeds = pipe.execute()
 
+            results: List[Tuple[str, float]] = []
             for qh, raw in zip(ordered_hashes, raw_embeds):
                 if raw is None:
                     continue
                 try:
-                    vec = np.array(json.loads(raw), dtype=np.float32).reshape(1, -1)
-                    sim = float(cosine_similarity(query_vec, vec)[0][0])
+                    vec = np.array(json.loads(raw), dtype=np.float32)
+                    sim = _cosine_similarity(query_vec, vec)
                     if sim >= self.threshold:
                         cache_key = self.r.get(f"sem:map:{qh}")
                         if cache_key:
@@ -183,7 +173,7 @@ class AdvancedCacheManager:
 
     L1: OrderedDict LRU  (in-process)
     L2: Redis            (shared, durable)
-    L3: SemanticCache    (similarity search)
+    L3: SemanticCache    (Gemini embeddings, similarity search)
     """
 
     L2_PREFIX = "cache:v2:"
@@ -221,7 +211,7 @@ class AdvancedCacheManager:
             else None
         )
 
-        # ── Stats (atomic with lock) ──────────────────────────────────────────
+        # ── Stats ─────────────────────────────────────────────────────────────
         self._stats_lock = threading.Lock()
         self._stats: Dict[str, int] = {
             "l1_hits": 0, "l1_misses": 0,
@@ -248,7 +238,6 @@ class AdvancedCacheManager:
             if time.time() > entry["expires_at"]:
                 del self._l1[key]
                 return None
-            # Move to end (most recently used)
             self._l1.move_to_end(key)
             entry["access_count"] += 1
             return entry
@@ -256,8 +245,7 @@ class AdvancedCacheManager:
     def _l1_set(self, key: str, value: Any, ttl: int, metadata: Dict) -> None:
         with self._l1_lock:
             if len(self._l1) >= self._l1_max:
-                # Evict LRU (first item) — O(1)
-                self._l1.popitem(last=False)
+                self._l1.popitem(last=False)   # evict LRU — O(1)
             self._l1[key] = {
                 "value": value,
                 "expires_at": time.time() + ttl,
@@ -285,11 +273,7 @@ class AdvancedCacheManager:
     # ── Public: get ───────────────────────────────────────────────────────────
 
     def get(self, query: str, context: Optional[Dict] = None) -> Optional[Dict]:
-        """
-        Lookup order: L1 → L2 → L3 (semantic).
-        Returns:
-            {response, cache_level, metadata}  or  None
-        """
+        """Lookup order: L1 → L2 → L3 (semantic)."""
         key = self._make_key(query, context)
 
         # L1
@@ -315,7 +299,7 @@ class AdvancedCacheManager:
             logger.warning("L2 get error: %s", exc)
         self._miss("l2")
 
-        # L3 — Semantic
+        # L3 — Semantic (Gemini)
         if self._semantic:
             try:
                 similar = self._semantic.find_similar(query, max_results=1)
@@ -333,7 +317,7 @@ class AdvancedCacheManager:
         return None
 
     def get_by_key(self, key: str) -> Optional[Dict]:
-        """Direct lookup by raw cache key."""
+        """Direct lookup by raw cache key (skips L3)."""
         entry = self._l1_get(key)
         if entry:
             return {"response": entry["value"], "cache_level": "L1",
@@ -358,17 +342,11 @@ class AdvancedCacheManager:
         context: Optional[Dict] = None,
         metadata: Optional[Dict] = None,
     ) -> str:
-        """
-        Store in L1 + L2. Adds to semantic index.
-        Returns the cache key.
-        """
         metadata = metadata or {}
         key = self._make_key(query, context)
 
-        # L1
         self._l1_set(key, response, ttl, metadata)
 
-        # L2
         try:
             payload = json.dumps({
                 "value": response,
@@ -379,7 +357,6 @@ class AdvancedCacheManager:
         except Exception as exc:
             logger.warning("L2 set error: %s", exc)
 
-        # L3 — index for semantic search (non-blocking)
         if self._semantic:
             try:
                 self._semantic.add(key, query)
@@ -395,10 +372,6 @@ class AdvancedCacheManager:
         key: Optional[str] = None,
         pattern: Optional[str] = None,
     ) -> int:
-        """
-        Invalidate by exact key or glob pattern.
-        Returns number of entries removed.
-        """
         removed = 0
 
         if key:
@@ -419,7 +392,6 @@ class AdvancedCacheManager:
             except Exception as exc:
                 logger.warning("Pattern invalidation error: %s", exc)
 
-            # L1 pattern match
             with self._l1_lock:
                 to_delete = [k for k in self._l1 if pattern in k]
                 for k in to_delete:
@@ -433,7 +405,6 @@ class AdvancedCacheManager:
     # ── Public: warm-up ───────────────────────────────────────────────────────
 
     def warm(self, entries: List[Tuple[str, Any]], ttl: int = 86400) -> int:
-        """Pre-populate cache. Returns number of entries warmed."""
         count = 0
         for query, response in entries:
             try:
@@ -448,7 +419,7 @@ class AdvancedCacheManager:
     def get_stats(self) -> Dict:
         with self._stats_lock:
             stats = dict(self._stats)
-        total = stats["total"] or 1  # avoid division by zero
+        total = stats["total"] or 1
         hits  = stats["l1_hits"] + stats["l2_hits"] + stats["semantic_hits"]
         with self._l1_lock:
             l1_size = len(self._l1)
@@ -462,7 +433,6 @@ class AdvancedCacheManager:
         }
 
     def get_hot_entries(self, limit: int = 10) -> List[Dict]:
-        """Return the most-accessed L1 entries."""
         with self._l1_lock:
             items = sorted(
                 self._l1.items(),
@@ -476,7 +446,6 @@ class AdvancedCacheManager:
         ]
 
     def health(self) -> Dict:
-        """Quick health check (used by /health endpoint)."""
         try:
             self._redis.ping()
             redis_ok = True
@@ -488,6 +457,7 @@ class AdvancedCacheManager:
 
 
 # ─── Singleton ────────────────────────────────────────────────────────────────
+
 _manager_lock = threading.Lock()
 _cache_manager_instance: Optional[AdvancedCacheManager] = None
 
@@ -499,7 +469,6 @@ def get_cache_manager(
     l1_max_size: int = 256,
     enable_semantic: bool = True,
 ) -> AdvancedCacheManager:
-    """Return (or create) the global AdvancedCacheManager singleton."""
     global _cache_manager_instance
     if _cache_manager_instance is None:
         with _manager_lock:
