@@ -1,5 +1,5 @@
 "use client";
-import { useEffect, useState, useMemo } from "react";
+import { useEffect, useState, useMemo, useRef } from "react";
 import { useParams } from "next/navigation";
 import axios from "axios";
 import { toast } from "sonner";
@@ -20,13 +20,19 @@ export default function CoursePreview() {
   const [chapterDurationBySlideId, setChapterDurationBySlideId] =
     useState<Record<string, number> | null>(null);
 
+  // ✅ Guard: prevents generateMissingContent from running more than once per courseId
+  const generationStarted = useRef(false);
+
+  // Reset everything when courseId changes
   useEffect(() => {
     setCourseDetail(null);
     setIntroDurationBySlideId(null);
     setChapterDurationBySlideId(null);
+    generationStarted.current = false;
     getCourseDetail();
   }, [courseId]);
 
+  // Compute audio durations only when courseDetail changes
   useEffect(() => {
     if (!courseDetail) return;
     const run = async () => {
@@ -57,20 +63,27 @@ export default function CoursePreview() {
     return Object.fromEntries(entries);
   };
 
+  // ✅ Fetch course ONCE — no recursive call at the end
   const getCourseDetail = async () => {
     const t = toast.loading("Fetching course...");
     try {
       const result = await axios.get(`/api/course?course_id=${courseId}`);
       const course: Course = result.data;
-      console.log(JSON.stringify(course));
       setCourseDetail(course);
       toast.success("Course loaded!", { id: t });
-      await generateMissingContent(course);
+
+      // ✅ Only trigger generation once per mount — not on every re-fetch
+      if (!generationStarted.current) {
+        generationStarted.current = true;
+        await generateMissingContent(course);
+      }
     } catch {
       toast.error("Failed to fetch course!", { id: t });
     }
   };
 
+  // ✅ After all generation is done, fetch course ONE final time to refresh state
+  // No loop: generate → fetch once → done
   const generateMissingContent = async (course: Course) => {
     const allChapters = course.courseLayout?.chapters || [];
     const generatedChapterIds = new Set(
@@ -81,6 +94,7 @@ export default function CoursePreview() {
     );
     const needsIntro = !course.courseIntroSlides?.length;
 
+    // ✅ Nothing missing — don't make any requests at all
     if (!needsIntro && missingChapters.length === 0) return;
 
     const tasks: Promise<void>[] = [];
@@ -105,6 +119,7 @@ export default function CoursePreview() {
     if (missingChapters.length > 0) {
       tasks.push(
         (async () => {
+          // ✅ Sequential — avoids hammering the API with parallel chapter requests
           for (const chapter of missingChapters) {
             const t = toast.loading(`Generating "${chapter.chapterTitle}"...`);
             try {
@@ -113,7 +128,15 @@ export default function CoursePreview() {
                 courseId
               });
               toast.success(`"${chapter.chapterTitle}" generated!`, { id: t });
-            } catch {
+            } catch (err: any) {
+              const status = err?.response?.status;
+              if (status === 429) {
+                // ✅ Stop immediately on rate limit — don't retry the rest
+                toast.error(`Rate limit hit — try again in a few minutes`, {
+                  id: t
+                });
+                break;
+              }
               toast.error(`Failed for "${chapter.chapterTitle}"`, { id: t });
             }
           }
@@ -122,7 +145,17 @@ export default function CoursePreview() {
     }
 
     await Promise.all(tasks);
-    getCourseDetail();
+
+    // ✅ ONE final refresh after all generation — no further generation triggered
+    // because generationStarted.current is already true
+    const t = toast.loading("Refreshing course...");
+    try {
+      const result = await axios.get(`/api/course?course_id=${courseId}`);
+      setCourseDetail(result.data);
+      toast.success("Course updated!", { id: t });
+    } catch {
+      toast.error("Failed to refresh course", { id: t });
+    }
   };
 
   const introDurationInFrames = useMemo(() => {

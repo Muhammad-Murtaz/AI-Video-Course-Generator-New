@@ -141,6 +141,8 @@ async def generate_course_layout(
 
 
 # ── Course Read ────────────────────────────────────────────────────────────────
+
+
 @api_router.get("/courses/{course_id}", dependencies=[Depends(RateLimitDep("read"))])
 async def get_course(course_id: str, db: Session = Depends(get_db)):
     cache = getattr(app.state, "cache", None)
@@ -203,9 +205,14 @@ async def generate_course_intro(
     request: CourseIntroRequest,
     db: Session = Depends(get_db),
 ):
+    # ── FIX: pass cache so the service can invalidate after writing ──
+    cache = getattr(app.state, "cache", None)
     try:
         result = course_service.generate_course_introduction(
-            db=db, course_id=request.courseId, course_layout=request.courseLayout
+            db=db,
+            course_id=request.courseId,
+            course_layout=request.courseLayout,
+            cache=cache,
         )
         return result
     except Exception as exc:
@@ -222,9 +229,14 @@ async def generate_video_content(
     video_request: GenerateVideoContentRequest,
     db: Session = Depends(get_db),
 ):
+    # ── FIX: pass cache so the service can invalidate after writing ──
+    cache = getattr(app.state, "cache", None)
     try:
         return course_service.generate_video_content(
-            db, chapter=video_request.chapter, course_id=video_request.course_id
+            db,
+            chapter=video_request.chapter,
+            course_id=video_request.course_id,
+            cache=cache,
         )
     except Exception as exc:
         raise HTTPException(

@@ -74,6 +74,7 @@ export default function CourseComposition({
     slides,
     durationBySlideId
   );
+
   const currentTime = localFrame / fps;
   const currentCaption =
     slide?.caption?.chunks?.find(
@@ -86,65 +87,73 @@ export default function CourseComposition({
 
   return (
     <AbsoluteFill>
+      {/* Audio track for this slide */}
+      {slide?.audioFileUrl && (
+        <Sequence from={startFrame} durationInFrames={duration}>
+          <Audio src={slide.audioFileUrl} />
+        </Sequence>
+      )}
+
+      {/*
+        FIX: The LLM generates HTML with a root div already set to
+        width:1280px; height:720px (exactly the Remotion canvas size).
+        The old code wrapped it in a 900px-max div, squeezing the 1280px
+        element and pushing content into a corner.
+
+        Solution: dangerouslySetInnerHTML goes directly onto AbsoluteFill's
+        inner div at full 1280×720 with no extra wrapper or max-width.
+        We use a CSS scale() transform so the HTML renders at native
+        1280×720 and then scales down to fit the preview Player width,
+        keeping everything perfectly centered.
+      */}
       <div
         style={{
-          position: "relative",
-          width: "100%",
-          height: "100%",
+          position: "absolute",
+          top: 0,
+          left: 0,
+          width: 1280,
+          height: 720,
+          transformOrigin: "top left",
+          transform: "scale(var(--remotion-scale, 1))",
+          // Dark fallback so white text is always readable if the LLM HTML
+          // background hasn't loaded yet or doesn't cover the full canvas.
           background:
-            "linear-gradient(135deg, #1e1b4b 0%, #312e81 50%, #1e1b4b 100%)",
-          overflow: "hidden"
+            "linear-gradient(135deg, #0f0f1a 0%, #0a0a2e 50%, #0d1117 100%)"
         }}
-      >
-        {slide?.audioFileUrl && (
-          <Sequence from={startFrame} durationInFrames={duration}>
-            <Audio src={slide.audioFileUrl} />
-          </Sequence>
-        )}
-        <div
-          style={{
-            position: "absolute",
-            top: 0,
-            left: 0,
-            width: "100%",
-            height: "85%",
-            display: "flex",
-            alignItems: "center",
-            justifyContent: "center",
-            padding: "40px"
-          }}
-        >
-          <div
-            dangerouslySetInnerHTML={{ __html: slide?.html || "" }}
-            style={{ color: "#fff", width: "100%", maxWidth: "900px" }}
-          />
-        </div>
+        dangerouslySetInnerHTML={{ __html: slide?.html || "" }}
+      />
+
+      {/* Caption bar — always sits above the HTML layer at the bottom */}
+      {currentCaption ? (
         <div
           style={{
             position: "absolute",
             bottom: 0,
             left: 0,
             width: "100%",
-            background: "rgba(0,0,0,0.6)",
-            padding: "12px 24px",
-            minHeight: "50px",
+            background: "rgba(0,0,0,0.72)",
+            padding: "14px 32px",
+            minHeight: 52,
             display: "flex",
             alignItems: "center",
-            justifyContent: "center"
+            justifyContent: "center",
+            zIndex: 10
           }}
         >
           <p
             style={{
               color: "#fff",
-              fontSize: 20,
+              fontSize: 22,
               textAlign: "center",
-              fontFamily: "sans-serif"
+              fontFamily: "sans-serif",
+              lineHeight: 1.4,
+              textShadow: "0 1px 4px rgba(0,0,0,0.8)"
             }}
           >
             {currentCaption}
           </p>
         </div>
-      </div>
+      ) : null}
     </AbsoluteFill>
   );
 }

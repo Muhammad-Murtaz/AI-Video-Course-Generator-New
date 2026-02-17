@@ -1,4 +1,4 @@
-from typing import List
+from typing import List, Optional
 from fastapi import HTTPException, status
 from concurrent.futures import ThreadPoolExecutor
 from app.schemas.course import CourseCreate
@@ -56,8 +56,38 @@ class CourseService:
         caption = caption_service.generate_captions(audio_url)
         return {"slide": slide, "audio_url": audio_url, "caption": caption}
 
+    def _invalidate_course_cache(self, cache, course_id: str) -> None:
+        """
+        Bust every cache tier that references this course.
+
+        We must remove:
+          • course:{course_id}   — the per-course detail key  (L1 + L2 + L3)
+          • Any pattern-matched variants (handles context-keyed entries)
+        """
+        if cache is None:
+            return
+        try:
+            # 1. Exact key invalidation (covers L1, L2, and L3 semantic map)
+            exact_key = cache._make_key(f"course:{course_id}")
+            cache.invalidate(key=exact_key)
+
+            # 2. Pattern invalidation catches any variant keys that include
+            #    the course_id (e.g. context-aware or versioned keys).
+            cache.invalidate(pattern=f"course:{course_id}")
+
+            logger.info("Cache invalidated for course_id=%s", course_id)
+        except Exception as exc:
+            # Cache errors must never break the main flow.
+            logger.warning(
+                "Cache invalidation failed for course_id=%s: %s", course_id, exc
+            )
+
     def generate_course_introduction(
-        self, db: Session, course_id: str, course_layout: dict
+        self,
+        db: Session,
+        course_id: str,
+        course_layout: dict,
+        cache=None,  # ← injected from the route handler
     ):
         existing = (
             db.query(CourseIntroSlide)
@@ -92,6 +122,10 @@ class CourseService:
             )
 
         db.commit()
+
+        # ── CACHE FIX: bust stale course snapshot after writing new slides ──
+        self._invalidate_course_cache(cache, course_id)
+
         return {
             "introContent": intro_content,
             "audioUrls": audio_urls,
@@ -167,7 +201,13 @@ class CourseService:
             .all()
         )
 
-    def generate_video_content(self, db: Session, chapter: dict, course_id: str):
+    def generate_video_content(
+        self,
+        db: Session,
+        chapter: dict,
+        course_id: str,
+        cache=None,  # ← injected from the route handler
+    ):
         existing = (
             db.query(ChapterContentSlide)
             .filter(
@@ -228,6 +268,10 @@ class CourseService:
             )
 
         db.commit()
+
+        # ── CACHE FIX: bust stale course snapshot after writing new slides ──
+        self._invalidate_course_cache(cache, course_id)
+
         return {
             "videoContent": video_content,
             "audioUrls": audio_urls,

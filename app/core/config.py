@@ -32,10 +32,9 @@ class Settings(BaseSettings):
     DEEPGRAM_API_KEY: str
     PHONAD_LAB_API_KEY: str
 
-    # Cloudinary
-    CLOUDINARY_CLOUD_NAME: str
-    CLOUDINARY_API_KEY: str
-    CLOUDINARY_API_SECRET: str
+    IMAGE_PUBLIC_KEY: str
+    IMAGE_PRIVATE_KEY: str
+    IMAGE_KIT_ENDPOINT_URL: str
 
     OPENAI_API_KEY: Optional[str] = None
 

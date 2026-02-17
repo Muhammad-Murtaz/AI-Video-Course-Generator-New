@@ -23,6 +23,28 @@ class BaseTask(Task):
         logger.info("Task %s[%s] succeeded", self.name, task_id)
 
 
+# ── Helper: get cache inside a Celery worker process ─────────────────────────
+
+
+def _get_cache():
+    """
+    Workers don't have access to app.state, so we grab the singleton
+    directly from the cache module. This is the same instance that was
+    initialised during FastAPI lifespan (same Redis connection params),
+    so invalidations here propagate to L2/L3 immediately.
+    """
+    try:
+        from app.services.cache import get_cache_manager
+
+        return get_cache_manager()
+    except Exception as exc:
+        logger.warning("Could not acquire cache manager in worker: %s", exc)
+        return None
+
+
+# ── Tasks ─────────────────────────────────────────────────────────────────────
+
+
 @celery_app.task(
     base=BaseTask,
     bind=True,
@@ -34,12 +56,14 @@ class BaseTask(Task):
     acks_late=True,
 )
 def generate_chapter_video_async(self, chapter: Dict[str, Any], course_id: str) -> Dict:
-    task_id = self.request.id
     try:
         self.update_state(state="PROGRESS", meta={"step": "starting", "progress": 0})
 
         from app.db.database import SessionLocal
         from app.services.course_service import course_service
+
+        # FIX: acquire the cache singleton so invalidation reaches L1+L2+L3
+        cache = _get_cache()
 
         db = SessionLocal()
         try:
@@ -47,7 +71,10 @@ def generate_chapter_video_async(self, chapter: Dict[str, Any], course_id: str) 
                 state="PROGRESS", meta={"step": "generating", "progress": 30}
             )
             result = course_service.generate_video_content(
-                db, chapter=chapter, course_id=course_id
+                db,
+                chapter=chapter,
+                course_id=course_id,
+                cache=cache,  # ← was missing; stale cache never cleared
             )
             self.update_state(state="PROGRESS", meta={"step": "done", "progress": 100})
         finally:
@@ -78,13 +105,20 @@ def generate_course_intro_async(self, course_id: str, course_layout: Dict) -> Di
         from app.db.database import SessionLocal
         from app.services.course_service import course_service
 
+        # FIX: same as above — must pass cache so intro generation busts the
+        # stale course snapshot that was cached before slides existed.
+        cache = _get_cache()
+
         db = SessionLocal()
         try:
             self.update_state(
                 state="PROGRESS", meta={"step": "generating", "progress": 40}
             )
             result = course_service.generate_course_introduction(
-                db=db, course_id=course_id, course_layout=course_layout
+                db=db,
+                course_id=course_id,
+                course_layout=course_layout,
+                cache=cache,  # ← was missing
             )
         finally:
             db.close()
@@ -105,31 +139,51 @@ def generate_course_intro_async(self, course_id: str, course_layout: Dict) -> Di
     ignore_result=True,
 )
 def warm_cache_task() -> None:
+    """
+    Pre-populate L1/L2 with full course data for the 50 most recent courses.
+
+    FIX: the original version warmed with only {courseId, courseName} — a
+    partial payload. Any subsequent GET /courses/{id} cache-hit would return
+    that stub instead of the real course object (missing slides, layout, etc.).
+    Now we call get_course_by_id() to warm with the identical shape that the
+    live route would cache, so cache hits are always safe to serve.
+    """
     try:
         from app.db.database import SessionLocal
         from app.services.course_service import course_service
         from app.services.cache import get_cache_manager
+        from app.db.model import Course
 
         cache = get_cache_manager()
         db = SessionLocal()
+        warmed = 0
         try:
-            courses = (
-                db.query(__import__("app.db.model", fromlist=["Course"]).Course)
-                .limit(50)
-                .all()
-            )
+            courses = db.query(Course).order_by(Course.id.desc()).limit(50).all()
             for course in courses:
-                cache.set(
-                    query=f"course:{course.course_id}",
-                    response={
-                        "courseId": course.course_id,
-                        "courseName": course.course_name,
-                    },
-                    ttl=86400,
-                    metadata={"warmed": True},
-                )
+                try:
+                    # get_course_by_id returns the same dict shape the API
+                    # route caches — slides, intro slides, layout, everything.
+                    full_course = course_service.get_course_by_id(db, course.course_id)
+                    if full_course:
+                        cache.set(
+                            query=f"course:{course.course_id}",
+                            response=full_course,
+                            ttl=86400,
+                            metadata={"warmed": True, "course_id": course.course_id},
+                        )
+                        warmed += 1
+                except Exception as exc:
+                    # One bad course must not abort the whole warm-up run.
+                    logger.warning(
+                        "Skipping course %s during warm-up: %s",
+                        course.course_id,
+                        exc,
+                    )
         finally:
             db.close()
+
+        logger.info("Cache warm-up complete: %d courses warmed", warmed)
+
     except Exception as exc:
         logger.error("Cache warm-up failed: %s", exc)
 
