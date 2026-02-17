@@ -38,6 +38,6 @@ imagekitio
 requests
 httpx
 orjson
-
+gunicorn
 replicate
 
