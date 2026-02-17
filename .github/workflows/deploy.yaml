@@ -72,6 +72,8 @@ jobs:
             -e GEMINI_API_KEY="${{ secrets.GEMINI_API_KEY }}" \
             -e OPENAI_API_KEY="${{ secrets.OPENAI_API_KEY }}" \
             -e GROQ_API_KEY="${{ secrets.GROQ_API_KEY }}" \
+            -e DEEPGRAM_API_KEY="${{ secrets.DEEPGRAM_API_KEY }}" \
+            -e PHONAD_LAB_API_KEY="${{ secrets.PHONAD_LAB_API_KEY }}" \
             -e NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY="${{ secrets.NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY }}" \
             -e CLERK_SECRET_KEY="${{ secrets.CLERK_SECRET_KEY }}" \
             -e CLOUDINARY_CLOUD_NAME="${{ secrets.CLOUDINARY_CLOUD_NAME }}" \
@@ -80,7 +82,6 @@ jobs:
             -e IMAGE_PUBLIC_KEY="${{ secrets.IMAGE_PUBLIC_KEY }}" \
             -e IMAGE_PRIVATE_KEY="${{ secrets.IMAGE_PRIVATE_KEY }}" \
             -e IMAGE_KIT_ENDPOINT_URL="${{ secrets.IMAGE_KIT_ENDPOINT_URL }}" \
-            -e DEEPGRAM_API_KEY="${{ secrets.DEEPGRAM_API_KEY }}" \
             -e REDIS_HOST="${{ secrets.REDIS_HOST }}" \
             -e REDIS_PORT="${{ secrets.REDIS_PORT }}" \
             -e REDIS_PASSWORD="${{ secrets.REDIS_PASSWORD }}" \
