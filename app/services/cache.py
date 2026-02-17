@@ -36,10 +36,7 @@ def _cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
 
 
 def _get_gemini_embedding(text: str) -> np.ndarray:
-    """
-    Call Gemini text-embedding-004 and return a float32 numpy array.
-    Requires GEMINI_API_KEY in environment (loaded via app.core.config).
-    """
+ 
     try:
         import google.generativeai as genai
         from app.core.config import settings
@@ -60,21 +57,12 @@ def _get_gemini_embedding(text: str) -> np.ndarray:
 # ─────────────────────────────────────────────────────────────────────────────
 
 class SemanticCache:
-    """
-    Stores Gemini embeddings in Redis so they survive restarts and are shared
-    across all worker processes.
-
-    Redis key scheme:
-      sem:emb:<sha256_of_query>  → JSON list (the embedding vector)
-      sem:txt:<sha256_of_query>  → original query text
-      sem:map:<sha256_of_query>  → cache_key the embedding maps to
-      sem:idx                    → Redis SET of all query hashes
-    """
+   
 
     EMBED_PREFIX = "sem:emb:"
     TEXT_PREFIX  = "sem:txt:"
     INDEX_KEY    = "sem:idx"
-    EMBED_TTL    = 86400 * 7      # 7 days
+    EMBED_TTL    = 86400 * 7     
 
     def __init__(
         self,
