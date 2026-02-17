@@ -1,48 +1,43 @@
-# Dockerfile
-# ─────────────────────────────────────────────────────────────────────────────
-# Multi-stage build:
-#   builder → installs dependencies
-#   runtime → lean production image
-# ─────────────────────────────────────────────────────────────────────────────
-
 # ── Stage 1: Build ────────────────────────────────────────────────────────────
 FROM python:3.11-slim AS builder
 
 WORKDIR /build
 
-# System deps for ML libs (sentence-transformers)
 RUN apt-get update && apt-get install -y --no-install-recommends \
     gcc g++ libpq-dev curl \
     && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt .
+
+# Create venv and install into it — no prefix ambiguity
+RUN python -m venv /opt/venv
+ENV PATH="/opt/venv/bin:$PATH"
 RUN pip install --upgrade pip \
-    && pip install --no-cache-dir --prefix=/install -r requirements.txt
+    && pip install --no-cache-dir -r requirements.txt
 
 # ── Stage 2: Runtime ─────────────────────────────────────────────────────────
 FROM python:3.11-slim AS runtime
 
 WORKDIR /app
 
-# Runtime system deps only
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libpq5 curl \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy installed packages from builder
-COPY --from=builder /install /usr/local
+# Copy the entire venv — structure is guaranteed
+COPY --from=builder /opt/venv /opt/venv
 
-# Copy application code
+# Make venv the active Python environment
+ENV PATH="/opt/venv/bin:$PATH"
+
 COPY . .
 
-# Non-root user for security
-RUN groupadd -r appuser && useradd -r -g appuser appuser
-RUN chown -R appuser:appuser /app
+RUN groupadd -r appuser && useradd -r -g appuser appuser \
+    && chown -R appuser:appuser /app
 USER appuser
 
 EXPOSE 8000
 
-# Default: run FastAPI (overridden in docker-compose for Celery workers)
 CMD ["gunicorn", "main:app", \
      "--worker-class", "uvicorn.workers.UvicornWorker", \
      "--workers", "4", \
