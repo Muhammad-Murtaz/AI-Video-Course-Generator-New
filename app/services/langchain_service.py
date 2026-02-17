@@ -114,9 +114,9 @@ def wrap_array_if_needed(raw: str, schema: Type[BaseModel]) -> str:
 class LangchainCourseGeneratorService:
     def __init__(self):
         self.llm = ChatGoogleGenerativeAI(
-            model="gemini-3-flash-preview",  # use a stable, high-output model
+            model="gemini-3-flash-preview",
             temperature=0.7,
-            max_tokens=20000,  # FIX 3: was 16000 — slides were being cut off mid-JSON
+            max_tokens=20000,
             api_key=settings.GEMINI_API_KEY,
         )
         self.fallback_llm = ChatGroq(
@@ -133,11 +133,8 @@ class LangchainCourseGeneratorService:
         except Exception as e:
             logger.warning("Gemini failed, falling back to Groq: %s", e)
 
-        # 2. Groq JSON fallback
         try:
-            # FIX 4 (token savings): send only field names, not the full JSON schema.
-            # The full schema was burning ~2 000 tokens on every fallback call,
-            # which rapidly exhausted the Groq daily token limit (100 000 TPD).
+
             schema_hint = (
                 "\n\nReturn ONLY valid JSON. "
                 "Top-level keys required: "
