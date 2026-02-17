@@ -1,13 +1,91 @@
-Continuous-Deployment:
-  needs: Continuous-Integration
-  runs-on: self-hosted   # ← change this from ubuntu-latest
-  steps:
-    - name: Deploy
-      run: |
-        aws ecr get-login-password --region ${{ secrets.AWS_DEFAULT_REGION }} \
-          | docker login --username AWS --password-stdin ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_DEFAULT_REGION }}.amazonaws.com
-        docker pull ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_DEFAULT_REGION }}.amazonaws.com/${{ secrets.ECR_REPO }}:latest
-        docker stop app-container || true
-        docker rm app-container || true
-        docker run -d --name app-container --env-file /home/ubuntu/app/.env -p 8080:8080 \
-          ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_DEFAULT_REGION }}.amazonaws.com/${{ secrets.ECR_REPO }}:latest
+name: Deploy Application Docker Image to EC2 instance
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  Continuous-Integration:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v3
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_DEFAULT_REGION }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build, tag, and push image to Amazon ECR
+        id: build-image
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          ECR_REPOSITORY: ${{ secrets.ECR_REPO }}
+          IMAGE_TAG: latest
+        run: |
+          docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG .
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+          echo "image=$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" >> $GITHUB_OUTPUT
+
+  Continuous-Deployment:
+    needs: Continuous-Integration
+    runs-on: self-hosted
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v3
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_DEFAULT_REGION }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Stop and remove old container
+        run: |
+          docker stop app-container || true
+          docker rm app-container || true
+
+      - name: Pull latest image
+        run: |
+          docker pull ${{ steps.login-ecr.outputs.registry }}/${{ secrets.ECR_REPO }}:latest
+
+      - name: Run Docker container
+        run: |
+          docker run -d \
+            --name app-container \
+            --restart unless-stopped \
+            -e AWS_ACCESS_KEY_ID="${{ secrets.AWS_ACCESS_KEY_ID }}" \
+            -e AWS_SECRET_ACCESS_KEY="${{ secrets.AWS_SECRET_ACCESS_KEY }}" \
+            -e AWS_DEFAULT_REGION="${{ secrets.AWS_DEFAULT_REGION }}" \
+            -e DATABASE_URL="${{ secrets.DATABASE_URL }}" \
+            -e GEMINI_API_KEY="${{ secrets.GEMINI_API_KEY }}" \
+            -e OPENAI_API_KEY="${{ secrets.OPENAI_API_KEY }}" \
+            -e GROQ_API_KEY="${{ secrets.GROQ_API_KEY }}" \
+            -e NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY="${{ secrets.NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY }}" \
+            -e CLERK_SECRET_KEY="${{ secrets.CLERK_SECRET_KEY }}" \
+            -e CLOUDINARY_CLOUD_NAME="${{ secrets.CLOUDINARY_CLOUD_NAME }}" \
+            -e CLOUDINARY_API_KEY="${{ secrets.CLOUDINARY_API_KEY }}" \
+            -e CLOUDINARY_API_SECRET="${{ secrets.CLOUDINARY_API_SECRET }}" \
+            -e IMAGE_PUBLIC_KEY="${{ secrets.IMAGE_PUBLIC_KEY }}" \
+            -e IMAGE_PRIVATE_KEY="${{ secrets.IMAGE_PRIVATE_KEY }}" \
+            -e IMAGE_KIT_ENDPOINT_URL="${{ secrets.IMAGE_KIT_ENDPOINT_URL }}" \
+            -e DEEPGRAM_API_KEY="${{ secrets.DEEPGRAM_API_KEY }}" \
+            -e REDIS_HOST="${{ secrets.REDIS_HOST }}" \
+            -e REDIS_PORT="${{ secrets.REDIS_PORT }}" \
+            -e REDIS_PASSWORD="${{ secrets.REDIS_PASSWORD }}" \
+            -p 8080:8080 \
+            ${{ steps.login-ecr.outputs.registry }}/${{ secrets.ECR_REPO }}:latest
+
+      - name: Clean up old images
+        run: docker image prune -af
