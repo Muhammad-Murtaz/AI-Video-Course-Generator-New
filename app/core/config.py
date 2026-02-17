@@ -30,7 +30,7 @@ class Settings(BaseSettings):
     GEMINI_API_KEY: str
     GROQ_API_KEY: str
     DEEPGRAM_API_KEY: str
-    PHONAD_LAB_API_KEY: str
+    PHONAD_LAB_API_KEY: Optional[str]
 
     IMAGE_PUBLIC_KEY: str
     IMAGE_PRIVATE_KEY: str
