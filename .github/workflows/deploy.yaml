@@ -1,107 +1,13 @@
-name: Deploy Application Docker Image to EC2 instance
-
-on:
-  push:
-    branches: [main]
-
-jobs:
-  Continuous-Integration:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v3
-
-      - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v2
-        with:
-          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region: ${{ secrets.AWS_DEFAULT_REGION }}
-
-      - name: Login to Amazon ECR
-        id: login-ecr
-        uses: aws-actions/amazon-ecr-login@v1
-
-      - name: Build, tag, and push image to Amazon ECR
-        id: build-image
-        env:
-          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
-          ECR_REPOSITORY: ${{ secrets.ECR_REPO }}
-          IMAGE_TAG: latest
-        run: |
-          docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG .
-          docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
-          echo "image=$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" >> $GITHUB_OUTPUT
-
-  Continuous-Deployment:
-    needs: Continuous-Integration
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v3
-
-      - name: Deploy to EC2
-        uses: appleboy/ssh-action@master
-        env:
-          ECR_REGISTRY: ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_DEFAULT_REGION }}.amazonaws.com
-          ECR_REPOSITORY: ${{ secrets.ECR_REPO }}
-        with:
-          host: ${{ secrets.EC2_HOST }}
-          username: ${{ secrets.EC2_USER }}
-          key: ${{ secrets.EC2_SSH_KEY }}
-          envs: ECR_REGISTRY,ECR_REPOSITORY
-          script: |
-            # Login to ECR
-            aws ecr get-login-password --region ${{ secrets.AWS_DEFAULT_REGION }} \
-              | docker login --username AWS --password-stdin $ECR_REGISTRY
-
-            # Navigate to app directory
-            cd /home/ubuntu/app
-
-            # Pull latest code
-            git pull origin main
-
-            # Write .env file from GitHub secrets
-            cat > .env << EOF
-            DATABASE_URL=${{ secrets.DATABASE_URL }}
-            NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY=${{ secrets.NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY }}
-            CLERK_SECRET_KEY=${{ secrets.CLERK_SECRET_KEY }}
-            NEXT_PUBLIC_CLERK_SIGN_IN_URL=/sign-in
-            NEXT_PUBLIC_CLERK_SIGN_UP_URL=/sign-up
-            NEXT_PUBLIC_CLERK_SIGN_IN_FALLBACK_REDIRECT_URL=/
-            NEXT_PUBLIC_CLERK_SIGN_UP_FALLBACK_REDIRECT_URL=/
-            GEMINI_API_KEY=${{ secrets.GEMINI_API_KEY }}
-            OPENAI_API_KEY=${{ secrets.OPENAI_API_KEY }}
-            GROQ_API_KEY=${{ secrets.GROQ_API_KEY }}
-            PHONAD_LAB_API_KEY=${{ secrets.PHONAD_LAB_API_KEY }}
-            CLOUDINARY_CLOUD_NAME=${{ secrets.CLOUDINARY_CLOUD_NAME }}
-            CLOUDINARY_API_KEY=${{ secrets.CLOUDINARY_API_KEY }}
-            CLOUDINARY_API_SECRET=${{ secrets.CLOUDINARY_API_SECRET }}
-            DEEPGRAM_API_KEY=${{ secrets.DEEPGRAM_API_KEY }}
-            IMAGE_PUBLIC_KEY=${{ secrets.IMAGE_PUBLIC_KEY }}
-            IMAGE_PRIVATE_KEY=${{ secrets.IMAGE_PRIVATE_KEY }}
-            IMAGE_KIT_ENDPOINT_URL=${{ secrets.IMAGE_KIT_ENDPOINT_URL }}
-            AWS_ACCESS_KEY_ID=${{ secrets.AWS_ACCESS_KEY_ID }}
-            AWS_SECRET_ACCESS_KEY=${{ secrets.AWS_SECRET_ACCESS_KEY }}
-            AWS_DEFAULT_REGION=${{ secrets.AWS_DEFAULT_REGION }}
-            EOF
-
-            # Pull latest image
-            docker pull $ECR_REGISTRY/$ECR_REPOSITORY:latest
-
-            # Stop and remove old container (if running)
-            docker stop app-container || true
-            docker rm app-container || true
-
-            # Run new container
-            docker run -d \
-              --name app-container \
-              --env-file .env \
-              -p 8080:8080 \
-              $ECR_REGISTRY/$ECR_REPOSITORY:latest
-
-            # Clean up old images
-            docker image prune -af
-
-            # Show running containers
-            docker ps
+Continuous-Deployment:
+  needs: Continuous-Integration
+  runs-on: self-hosted   # ← change this from ubuntu-latest
+  steps:
+    - name: Deploy
+      run: |
+        aws ecr get-login-password --region ${{ secrets.AWS_DEFAULT_REGION }} \
+          | docker login --username AWS --password-stdin ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_DEFAULT_REGION }}.amazonaws.com
+        docker pull ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_DEFAULT_REGION }}.amazonaws.com/${{ secrets.ECR_REPO }}:latest
+        docker stop app-container || true
+        docker rm app-container || true
+        docker run -d --name app-container --env-file /home/ubuntu/app/.env -p 8080:8080 \
+          ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_DEFAULT_REGION }}.amazonaws.com/${{ secrets.ECR_REPO }}:latest
