@@ -1,15 +1,3 @@
-# docker-compose.yml
-# ─────────────────────────────────────────────────────────────────────────────
-# Services:
-#   api          → FastAPI (4 Uvicorn workers via Gunicorn)
-#   celery-ai    → Celery worker for ai_generation queue
-#   celery-video → Celery worker for video_proc queue
-#   celery-maint → Celery worker for maintenance queue
-#   celery-beat  → Periodic task scheduler
-#   flower       → Celery monitoring UI  (localhost:5555)
-#   redis        → Broker + cache backend
-#   nginx        → Reverse proxy + load balancer
-# ─────────────────────────────────────────────────────────────────────────────
 
 version: "3.9"
 
@@ -35,7 +23,7 @@ x-api-base: &api-base
   restart: unless-stopped
 
 services:
-  # ── FastAPI Application ─────────────────────────────────────────────────────
+ 
   api:
     <<: *api-base
     command: >
