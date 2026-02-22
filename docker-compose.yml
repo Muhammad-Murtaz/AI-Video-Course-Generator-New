@@ -43,6 +43,18 @@ services:
       retries: 3
       start_period: 20s
 
+  frontend:
+    build:
+      context: ./frontend    # ← change this to your frontend folder name
+      dockerfile: Dockerfile
+    ports:
+      - "3000:3000"
+    restart: unless-stopped
+    environment:
+      - NEXT_PUBLIC_API_URL=http://13.49.80.30:8000
+    depends_on:
+      - api
+
   # ── Celery — AI Generation Worker ──────────────────────────────────────────
   celery-ai:
     <<: *api-base
