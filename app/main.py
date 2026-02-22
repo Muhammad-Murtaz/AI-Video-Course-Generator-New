@@ -72,13 +72,12 @@ async def get_user_email(x_user_email: Optional[str] = Header(None)) -> str:
     return x_user_email
 
 
+from fastapi.responses import RedirectResponse
+
+
 @app.get("/")
 async def root():
-    return {
-        "message": "AI Video Course Generator API",
-        "status": "running",
-        "version": "2.0.0",
-    }
+    return RedirectResponse(url="http://51.20.135.149:3000")
 
 
 @app.get("/health")

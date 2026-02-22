@@ -11,7 +11,10 @@ class Settings(BaseSettings):
 
     # App
     APP_ENV: str = "production"
-    ALLOWED_ORIGINS: List[str] = ["http://localhost:3000"]
+    ALLOWED_ORIGINS: List[str] = [
+        "http://51.20.135.149:3000",
+        "http://localhost:3000",
+    ]
 
     # Database
     DATABASE_URL: str
